@@ -55,3 +55,6 @@ scratch/
 *.local.json
 *.local.yaml
 *.local.yml
+
+.worktrees/
+.worktrees/fix-patch-default-cwd
