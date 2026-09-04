@@ -15,6 +15,7 @@ use super::model::{
     TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
+use crate::tools::workspace::DEFAULT_EXCLUDED_NAMES;
 
 #[derive(Debug, Clone)]
 pub struct Harness {
@@ -482,19 +483,11 @@ impl Harness {
 
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
     let mut entries = Vec::new();
-    for item in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = item.path();
-        if path == root || should_skip(path, root) || !item.file_type().is_file() {
-            continue;
-        }
-        let Ok(bytes) = fs::read(path) else { continue };
+    for path in baseline_files(root) {
+        let Ok(bytes) = fs::read(&path) else { continue };
         let rel = path
             .strip_prefix(root)
-            .unwrap_or(path)
+            .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
         let mut hasher = Sha256::new();
@@ -523,25 +516,190 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
     }
 }
 
-fn should_skip(path: &Path, root: &Path) -> bool {
-    path.strip_prefix(root)
-        .ok()
+fn baseline_files(root: &Path) -> Vec<PathBuf> {
+    if let Some(relative) = git_visible_files(root) {
+        return relative
+            .into_iter()
+            .map(|rel| join_relative(root, &rel))
+            .filter(|path| path.is_file() && !should_skip(path, root))
+            .collect();
+    }
+    WalkDir::new(root)
+        .follow_links(false)
         .into_iter()
-        .flat_map(|p| p.components())
+        .filter_map(Result::ok)
+        .filter(|item| item.file_type().is_file())
+        .map(|item| item.into_path())
+        .filter(|path| path != root && !should_skip(path, root))
+        .collect()
+}
+
+fn git_visible_files(root: &Path) -> Option<Vec<String>> {
+    let toplevel = git_value(root, &["rev-parse", "--show-toplevel"])?;
+    if normalize_path(Path::new(toplevel.trim())) != normalize_path(root) {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| String::from_utf8_lossy(chunk).replace('\\', "/"))
+            .collect(),
+    )
+}
+
+fn join_relative(root: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .fold(root.to_path_buf(), |mut path, part| {
+            path.push(part);
+            path
+        })
+}
+
+const HARNESS_CACHE_DIR_NAMES: &[&str] = &[
+    ".coding-tools",
+    ".mcp-probe-kit",
+    ".gitnexus",
+    ".worktrees",
+    ".svelte-kit",
+    ".vite",
+    ".turbo",
+    ".next",
+    ".nuxt",
+    ".cache",
+    ".parcel-cache",
+    ".nyc_output",
+    ".idea",
+    ".mcp",
+    ".mcp-cache",
+    ".tmp",
+];
+
+const HARNESS_ROOT_DIR_NAMES: &[&str] = &[
+    "coverage",
+    "scratch",
+    ".scratch",
+    "tmp-run",
+    ".local-build",
+];
+
+fn should_skip(path: &Path, root: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    let posix = relative.to_string_lossy().replace('\\', "/");
+    if posix == "docs/history-session" || posix.starts_with("docs/history-session/") {
+        return true;
+    }
+    let names: Vec<&str> = relative
+        .components()
         .filter_map(|component| component.as_os_str().to_str())
-        .any(|name| {
+        .collect();
+    if names.iter().any(|name| {
+        DEFAULT_EXCLUDED_NAMES.contains(name) || HARNESS_CACHE_DIR_NAMES.contains(name)
+    }) {
+        return true;
+    }
+    if names
+        .first()
+        .is_some_and(|name| HARNESS_ROOT_DIR_NAMES.contains(name))
+    {
+        return true;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
             matches!(
                 name,
-                ".git"
-                    | ".coding-tools"
-                    | ".mcp-probe-kit"
-                    | "node_modules"
-                    | "target"
-                    | "dist"
-                    | "build"
-                    | ".svelte-kit"
-            )
+                ".DS_Store"
+                    | "Thumbs.db"
+                    | "desktop.ini"
+                    | ".eslintcache"
+                    | "lcov.info"
+                    | "coverage.xml"
+                    | ".coverage"
+                    | "cobertura.xml"
+            ) || name.ends_with(".tsbuildinfo")
+                || name.ends_with(".pyc")
+                || name.ends_with(".pyo")
+                || name.ends_with(".snap.new")
+                || name.ends_with(".pending-snap")
+                || name.ends_with('~')
+                || name.ends_with(".orig")
+                || name.ends_with(".rej")
+                || name.ends_with(".bak")
+                || name.ends_with(".swp")
+                || name.ends_with(".swo")
+                || name.contains(".timestamp-")
+                || name.contains(".harness-stage-")
         })
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        let candidate = msys_drive_path(&raw)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+        let canonical = fs::canonicalize(&candidate).unwrap_or(candidate);
+        PathBuf::from(normalize_windows_path_text(&canonical.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+#[cfg(windows)]
+fn msys_drive_path(raw: &str) -> Option<String> {
+    let rest = raw.trim().strip_prefix('/')?;
+    let mut chars = rest.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    match chars.next() {
+        None => Some(format!("{drive}:")),
+        Some('/') => Some(format!("{drive}:\\{}", chars.as_str().replace('/', "\\"))),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows_path_text(raw: &str) -> String {
+    let text = raw.replace('/', "\\");
+    let stripped = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text
+    };
+    stripped.trim_end_matches('\\').to_lowercase()
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
@@ -616,6 +774,23 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_strips_extended_and_msys_prefixes() {
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\C:\repo\app")),
+            PathBuf::from(r"c:\repo\app")
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/d/TianFeng/repo")),
+            PathBuf::from(r"d:\tianfeng\repo")
+        );
     }
 
     #[test]

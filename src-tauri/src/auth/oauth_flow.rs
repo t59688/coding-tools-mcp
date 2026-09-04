@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,7 @@ pub struct OAuthRuntime {
     pub token_secret: String,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
     clients: Arc<Mutex<HashMap<String, RegisteredClient>>>,
+    store_path: Option<PathBuf>,
 }
 
 fn registration_error(error: &str, description: &str) -> Response {
@@ -49,7 +51,8 @@ fn valid_redirect_uri(uri: &str) -> bool {
 struct RegisteredClient {
     redirect_uris: Vec<String>,
     token_endpoint_auth_method: String,
-    client_secret: Option<String>,
+    client_secret_sha256: Option<String>,
+    issued_at: u64,
 }
 
 #[derive(Clone)]
@@ -89,7 +92,53 @@ impl OAuthRuntime {
             token_secret,
             pending: Arc::new(Mutex::new(HashMap::new())),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            store_path: None,
         }
+    }
+
+    pub fn with_client_store(self, path: PathBuf) -> Self {
+        let loaded = super::dcr_store::load(&path)
+            .into_iter()
+            .map(|(id, record)| {
+                (
+                    id,
+                    RegisteredClient {
+                        redirect_uris: record.redirect_uris,
+                        token_endpoint_auth_method: record.token_endpoint_auth_method,
+                        client_secret_sha256: record.client_secret_sha256,
+                        issued_at: record.issued_at,
+                    },
+                )
+            })
+            .collect();
+        *self.clients.lock().expect("oauth clients lock") = loaded;
+        Self {
+            store_path: Some(path),
+            ..self
+        }
+    }
+
+    fn persist_clients(&self) -> Result<(), String> {
+        let Some(path) = self.store_path.as_ref() else {
+            return Ok(());
+        };
+        let snapshot = self.clients.lock().expect("oauth clients lock");
+        let stored = snapshot
+            .iter()
+            .map(|(id, client)| {
+                (
+                    id.clone(),
+                    super::dcr_store::StoredClient {
+                        client_id: id.clone(),
+                        redirect_uris: client.redirect_uris.clone(),
+                        token_endpoint_auth_method: client.token_endpoint_auth_method.clone(),
+                        client_secret_sha256: client.client_secret_sha256.clone(),
+                        issued_at: client.issued_at,
+                    },
+                )
+            })
+            .collect();
+        super::dcr_store::save(path, &stored)
     }
 
     pub fn client_id_allowed(&self, client_id: &str) -> bool {
@@ -132,10 +181,9 @@ impl OAuthRuntime {
         if client.token_endpoint_auth_method == "none" {
             return true;
         }
-        client
-            .client_secret
-            .as_deref()
-            .is_some_and(|expected| constant_time_eq_str(client_secret, expected))
+        client.client_secret_sha256.as_deref().is_some_and(|expected| {
+            constant_time_eq_str(&super::dcr_store::secret_sha256(client_secret), expected)
+        })
     }
 
     pub fn verify_access_token(&self, token: &str, server_url: &str) -> bool {
@@ -152,7 +200,7 @@ impl OAuthRuntime {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClientRegistrationRequest {
     pub redirect_uris: Vec<String>,
     #[serde(default)]
@@ -195,28 +243,95 @@ pub fn register_client(oauth: &OAuthRuntime, request: ClientRegistrationRequest)
             )
         }
     };
+    let redirect_uris = normalized_redirect_uris(&request.redirect_uris);
+    if let Some((client_id, issued_at)) =
+        existing_registration(oauth, &redirect_uris, auth_method)
+    {
+        return registration_created(
+            client_id,
+            issued_at,
+            redirect_uris,
+            auth_method,
+            None,
+            request.client_name,
+        );
+    }
+    let issued_at = unix_now();
     let client_id = format!("dcr-{}", uuid::Uuid::new_v4().simple());
     let client_secret = (auth_method != "none")
         .then(|| uuid::Uuid::new_v4().simple().to_string());
     oauth.clients.lock().expect("oauth clients lock").insert(
         client_id.clone(),
         RegisteredClient {
-            redirect_uris: request.redirect_uris.clone(),
+            redirect_uris: redirect_uris.clone(),
             token_endpoint_auth_method: auth_method.to_string(),
-            client_secret: client_secret.clone(),
+            client_secret_sha256: client_secret.as_deref().map(super::dcr_store::secret_sha256),
+            issued_at,
         },
     );
+    if let Err(error) = oauth.persist_clients() {
+        oauth.clients.lock().expect("oauth clients lock").remove(&client_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({
+                "error": "server_error",
+                "error_description": format!("Failed to persist registered client: {error}")
+            })),
+        )
+            .into_response();
+    }
 
+    registration_created(
+        client_id,
+        issued_at,
+        redirect_uris,
+        auth_method,
+        client_secret,
+        request.client_name,
+    )
+}
+
+pub fn oauth_client_store_path(workspace_id: &str, service: &str) -> Option<PathBuf> {
+    super::dcr_store::store_path(workspace_id, service)
+}
+
+fn normalized_redirect_uris(uris: &[String]) -> Vec<String> {
+    let mut uris: Vec<String> = uris.iter().map(|uri| uri.trim().to_string()).collect();
+    uris.sort();
+    uris.dedup();
+    uris
+}
+
+fn existing_registration(
+    oauth: &OAuthRuntime,
+    redirect_uris: &[String],
+    auth_method: &str,
+) -> Option<(String, u64)> {
+    let clients = oauth.clients.lock().expect("oauth clients lock");
+    clients.iter().find_map(|(id, client)| {
+        (client.token_endpoint_auth_method == auth_method && client.redirect_uris == redirect_uris)
+            .then(|| (id.clone(), client.issued_at))
+    })
+}
+
+fn registration_created(
+    client_id: String,
+    issued_at: u64,
+    redirect_uris: Vec<String>,
+    auth_method: &str,
+    client_secret: Option<String>,
+    client_name: String,
+) -> Response {
     let mut body = json!({
         "client_id": client_id,
-        "client_id_issued_at": unix_now(),
-        "redirect_uris": request.redirect_uris,
+        "client_id_issued_at": issued_at,
+        "redirect_uris": redirect_uris,
         "token_endpoint_auth_method": auth_method,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"]
     });
-    if !request.client_name.trim().is_empty() {
-        body["client_name"] = Value::String(request.client_name);
+    if !client_name.trim().is_empty() {
+        body["client_name"] = Value::String(client_name);
     }
     if let Some(secret) = client_secret {
         body["client_secret"] = Value::String(secret);
@@ -780,6 +895,88 @@ mod tests {
             "https://chatgpt.com/connector/oauth/test"
         ));
         assert!(!oauth.redirect_uri_allowed(&client_id, "https://attacker.example/callback"));
+    }
+
+    #[test]
+    fn dynamic_registration_survives_runtime_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mcp.json");
+        let first = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "legacy-client".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        )
+        .with_client_store(path.clone());
+        let response = register_client(
+            &first,
+            ClientRegistrationRequest {
+                redirect_uris: vec!["https://chatgpt.com/connector/oauth/test".into()],
+                token_endpoint_auth_method: "none".into(),
+                grant_types: vec!["authorization_code".into()],
+                response_types: vec!["code".into()],
+                client_name: "ChatGPT".into(),
+            },
+        );
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let client_id = first
+            .clients
+            .lock()
+            .expect("clients")
+            .keys()
+            .next()
+            .expect("client id")
+            .clone();
+        drop(first);
+
+        let restored = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "legacy-client".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        )
+        .with_client_store(path);
+        assert!(restored.client_id_allowed(&client_id));
+        let login = authorize_get(
+            &restored,
+            AuthorizeParams {
+                response_type: "code".into(),
+                client_id,
+                redirect_uri: "https://chatgpt.com/connector/oauth/test".into(),
+                code_challenge: "challenge".into(),
+                code_challenge_method: "S256".into(),
+                state: "state".into(),
+            },
+            None,
+            "https://lb.example.com",
+        );
+        assert_eq!(login.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn dynamic_registration_is_idempotent_for_the_same_redirect_uris() {
+        let oauth = OAuthRuntime::new(
+            "https://lb.example.com".into(),
+            "legacy-client".into(),
+            None,
+            "test-password".into(),
+            "token-signing-secret".into(),
+        );
+        let request = ClientRegistrationRequest {
+            redirect_uris: vec![
+                "https://chatgpt.com/connector/oauth/b".into(),
+                "https://chatgpt.com/connector/oauth/a".into(),
+            ],
+            token_endpoint_auth_method: "none".into(),
+            grant_types: Vec::new(),
+            response_types: Vec::new(),
+            client_name: "ChatGPT".into(),
+        };
+        register_client(&oauth, request.clone());
+        register_client(&oauth, request);
+        assert_eq!(oauth.clients.lock().expect("clients").len(), 1);
     }
 
     #[test]

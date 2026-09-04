@@ -223,6 +223,134 @@ fn 外部修改会在写工具执行前被拒绝() {
 }
 
 #[test]
+fn 失败的exec副作用不应锁住后续执行() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "失败命令副作用"}));
+    assert_eq!(started["ok"], true);
+
+    let failed = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": "python -c \"open('side-effect.txt','w',encoding='utf-8').write('x'); raise SystemExit(1)\"",
+            "filesystem_scope": "workspace"
+        }),
+    );
+    assert_eq!(failed["ok"], true, "工具信封仍为 ok: {failed}");
+    assert_eq!(failed["command_ok"], false, "命令应非零退出: {failed}");
+    assert!(workspace.join("side-effect.txt").exists());
+
+    let next = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
+    );
+    assert_eq!(next["ok"], true, "失败 exec 的工作区副作用应被吸收: {next}");
+    assert_ne!(
+        next.get("error").and_then(|error| error.get("code")),
+        Some(&json!("FILE_CHANGED_EXTERNALLY"))
+    );
+}
+
+#[test]
+fn 自定义历史目录写入不应锁住后续执行() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    let started = call_tool(&ctx, "start_task", &json!({"objective": "历史目录写入"}));
+    assert_eq!(started["ok"], true);
+
+    let bootstrapped = call_tool(
+        &ctx,
+        "history_session_bootstrap",
+        &json!({
+            "history_dir": "notes/sessions",
+            "title": "sidecar",
+            "initial_user_input": "record this session"
+        }),
+    );
+    assert_eq!(bootstrapped["ok"], true, "bootstrap: {bootstrapped}");
+    assert!(workspace.join("notes/sessions").is_dir());
+
+    let next = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
+    );
+    assert_eq!(next["ok"], true, "自定义 history_dir 写入应被吸收: {next}");
+    assert_ne!(
+        next.get("error").and_then(|error| error.get("code")),
+        Some(&json!("FILE_CHANGED_EXTERNALLY"))
+    );
+}
+
+#[test]
+fn 读输出和规划查询不得吸收外部源码修改() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    assert_eq!(
+        call_tool(&ctx, "start_task", &json!({"objective": "读路径不得吞源码"}))["ok"],
+        true
+    );
+
+    fs::write(workspace.join("README.md"), "外部修改\n").expect("模拟 IDE 改源码");
+    let _ = call_tool(
+        &ctx,
+        "read_output",
+        &json!({"output_ref": "session:missing:stdout"}),
+    );
+    let _ = call_tool(&ctx, "planning_state", &json!({}));
+
+    let next = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
+    );
+    assert_eq!(next["ok"], false, "读路径不应吸收外部源码修改: {next}");
+    assert_eq!(next["error"]["code"], "FILE_CHANGED_EXTERNALLY");
+}
+
+#[test]
+fn 失败的patch不应把干净工作区锁死() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx =
+        ToolContext::for_test(workspace.clone(), temp.path().join("harness")).expect("创建上下文");
+    assert_eq!(
+        call_tool(&ctx, "start_task", &json!({"objective": "失败 patch 不锁死"}))["ok"],
+        true
+    );
+
+    let failed = call_tool(&ctx, "apply_patch", &json!({"patch": "not a valid patch"}));
+    assert_eq!(failed["ok"], false, "非法 patch 应为失败: {failed}");
+
+    let next = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
+    );
+    assert_eq!(next["ok"], true, "失败 patch 后干净工作区应仍可执行: {next}");
+    assert_ne!(
+        next.get("error").and_then(|error| error.get("code")),
+        Some(&json!("FILE_CHANGED_EXTERNALLY"))
+    );
+}
+
+#[test]
 fn 工具清单包含项目状态和任务上下文能力() {
     let tools = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("advanced");
     let names = tools

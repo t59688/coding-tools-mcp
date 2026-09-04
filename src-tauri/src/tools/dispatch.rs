@@ -505,9 +505,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
             operation_input(args),
             json!({"ok": succeeded, "tool": name}),
         );
-        if succeeded {
-            let _ = ctx.harness.refresh_expected_state(task_id);
-        }
+        let _ = ctx.harness.refresh_expected_state(task_id);
     }
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
@@ -525,6 +523,11 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         );
     }
     record_execution_ledger(ctx, name, &effective_args, &output, task_id.as_deref());
+    if should_absorb_sidecar_writes(name) {
+        if let Some(task) = ctx.harness.current_task().ok().flatten() {
+            let _ = ctx.harness.refresh_expected_state(&task.id);
+        }
+    }
     if should_attach_planning_context(ctx, name, &output) {
         if let Ok(latest) = PlanningService::new(ctx.workspace.root()).state() {
             output = attach_planning_context(output, &latest);
@@ -721,6 +724,17 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+fn should_absorb_sidecar_writes(name: &str) -> bool {
+    matches!(
+        name,
+        "history_session_bootstrap"
+            | "history_session_checkpoint"
+            | "history_session_validate"
+            | "history_manage"
+            | "kill_session"
+    )
 }
 
 fn standalone_operation(name: &str) -> bool {

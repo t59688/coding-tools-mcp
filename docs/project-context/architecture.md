@@ -102,7 +102,7 @@ MCP 与 Actions 共用同一 OAuth runtime：
 
 - Authorization Code；
 - PKCE `S256`；
-- Dynamic Client Registration `/register`；
+- Dynamic Client Registration `/register`（按工作区持久化到应用配置目录，secret 只存 SHA-256）；
 - `authorization_code` 与 `refresh_token` grant；
 - Access / Refresh JWT 类型区分；
 - 动态 Client 绑定已注册 redirect URI。

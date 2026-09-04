@@ -15,7 +15,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, protected_resource_metadata_url, register_client, token_exchange,
+    protected_resource_metadata, protected_resource_metadata_url, oauth_client_store_path,
+    register_client, token_exchange,
     verify_bearer_header, verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams,
     ClientRegistrationRequest, OAuthRuntime, TokenForm,
 };
@@ -143,13 +144,19 @@ pub fn spawn_listener(
             port,
             &configured_public_url,
         );
-        Some(Arc::new(OAuthRuntime::new(
-            oauth_base,
-            auth.oauth_client_id.clone(),
-            oauth_client_secret.clone(),
-            password,
-            token_secret,
-        )))
+        Some(Arc::new({
+            let runtime = OAuthRuntime::new(
+                oauth_base,
+                auth.oauth_client_id.clone(),
+                oauth_client_secret.clone(),
+                password,
+                token_secret,
+            );
+            match oauth_client_store_path(&workspace_id, "mcp") {
+                Some(path) => runtime.with_client_store(path),
+                None => runtime,
+            }
+        }))
     } else {
         None
     };

@@ -17,7 +17,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    register_client, token_exchange, AuthorizeForm, AuthorizeParams, ClientRegistrationRequest,
+    oauth_client_store_path, register_client, token_exchange, AuthorizeForm, AuthorizeParams, ClientRegistrationRequest,
     OAuthRuntime, TokenForm,
 };
 use crate::tools::{self, is_allowed_tool, policy::PolicySettings, wrap_tool_result, ToolContext};
@@ -87,13 +87,19 @@ pub fn spawn_listener(
             actions_port,
             &configured_public_url,
         );
-        Some(Arc::new(OAuthRuntime::new(
-            oauth_base,
-            oauth_client_id,
-            oauth_client_secret.clone(),
-            oauth_password.unwrap_or_default(),
-            oauth_token_secret.unwrap_or_default(),
-        )))
+        Some(Arc::new({
+            let runtime = OAuthRuntime::new(
+                oauth_base,
+                oauth_client_id,
+                oauth_client_secret.clone(),
+                oauth_password.unwrap_or_default(),
+                oauth_token_secret.unwrap_or_default(),
+            );
+            match oauth_client_store_path(workspace_id, "actions") {
+                Some(path) => runtime.with_client_store(path),
+                None => runtime,
+            }
+        }))
     } else {
         None
     };
