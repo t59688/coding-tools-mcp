@@ -532,6 +532,8 @@ fn history_tools_are_exposed_with_public_schemas() {
             .unwrap_or_else(|| panic!("missing tool: {name}"));
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(tool["outputSchema"]["type"], "object");
+        assert_eq!(tool["outputSchema"]["required"], serde_json::json!(["ok"]));
         assert!(tool["inputSchema"]["properties"]
             .get("_host_session_key")
             .is_none());

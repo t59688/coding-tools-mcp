@@ -516,3 +516,62 @@ fn grep_reuses_search_text_schema_and_behavior() {
         .iter()
         .all(|item| item["path"].as_str().unwrap_or("").starts_with("src/")));
 }
+
+#[test]
+fn advertised_tools_publish_output_schema_and_live_results_fit_it() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let tools = list_tools_for_profile("core");
+    for tool in &tools {
+        assert!(
+            tool["outputSchema"]["properties"]["ok"].is_object(),
+            "{} missing outputSchema.ok",
+            tool["name"]
+        );
+        assert_eq!(tool["outputSchema"]["additionalProperties"], false);
+    }
+
+    let samples = [
+        ("server_info", json!({})),
+        ("capability_health_check", json!({})),
+        ("check_exec_environment", json!({})),
+        ("get_default_cwd", json!({})),
+        ("list_dir", json!({"path": "."})),
+        ("list_files", json!({"path": "src", "max_results": 20})),
+        ("list_skills", json!({})),
+        ("planning_state", json!({})),
+        ("git_status", json!({})),
+        ("read_file", json!({"path": "src/math.js"})),
+        ("planning_manage", json!({"action": "state"})),
+        ("task_manage", json!({"action": "status"})),
+        ("apply_patch", json!({
+            "patch": "*** Begin Patch\n*** Update File: src/math.js\n@@\n-export function add(a, b) {\n+export function add(a, b) {\n*** End Patch",
+            "dry_run": true
+        })),
+    ];
+    for (name, args) in samples {
+        let output = invoke(&ctx, name, args);
+        let schema = coding_tools_mcp_desktop_lib::tools::output_schema(name);
+        let allowed = schema["properties"]
+            .as_object()
+            .expect("output properties")
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let actual = output
+            .as_object()
+            .expect("object result")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let unexpected = actual
+            .iter()
+            .filter(|key| !allowed.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "{name} returned undeclared output keys {unexpected:?}; keys={actual:?}"
+        );
+    }
+}

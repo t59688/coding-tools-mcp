@@ -824,6 +824,7 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
                         description
                     },
                     "inputSchema": input_schema(name),
+                    "outputSchema": super::output_schema::output_schema(name),
                     "annotations": {
                         "title": title,
                         "readOnlyHint": read_only,
@@ -1340,6 +1341,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{input_schema, list_tools_for_profile, tool_api_descriptor};
+    use crate::tools::output_schema;
 
     #[test]
     fn core_catalog_excludes_non_persistent_permission_tool() {
@@ -1379,6 +1381,14 @@ mod tests {
             assert!(schema.get("oneOf").is_none(), "{name} oneOf");
             assert!(schema.get("anyOf").is_none(), "{name} anyOf");
             assert!(schema.get("$ref").is_none(), "{name} ref");
+
+            let output = output_schema(name);
+            assert_eq!(output["type"], "object", "{name} output type");
+            assert_eq!(output["required"], serde_json::json!(["ok"]), "{name} output required");
+            assert!(output["properties"]["ok"].is_object(), "{name} output ok");
+            assert!(output.get("oneOf").is_none(), "{name} output oneOf");
+            assert!(output.get("anyOf").is_none(), "{name} output anyOf");
+            assert!(output.get("$ref").is_none(), "{name} output ref");
         }
     }
 

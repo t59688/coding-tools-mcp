@@ -7,7 +7,7 @@
 | 属性 | 当前值 |
 | --- | --- |
 | 项目名称 | Coding Tools MCP |
-| 版本 | `0.2.2` |
+| 版本 | `0.2.3` |
 | 桌面端 | Tauri 2 |
 | 前端 | SvelteKit 2 + Svelte 5 + TypeScript |
 | 后端 | Rust 2021 + Tokio + Axum |

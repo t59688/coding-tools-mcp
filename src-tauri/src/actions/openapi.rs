@@ -24,6 +24,11 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
                     "additionalProperties": true
                 })
             });
+        let output_schema = tool
+            .get("outputSchema")
+            .filter(|schema| schema.is_object())
+            .cloned()
+            .unwrap_or_else(default_structured_content_schema);
 
         let description_raw = tool
             .get("description")
@@ -49,7 +54,7 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
                     "description": "Tool execution result",
                     "content": {
                         "application/json": {
-                            "schema": { "$ref": "#/components/schemas/ToolExecutionResponse" }
+                            "schema": tool_execution_response_schema(output_schema)
                         }
                     }
                 },
@@ -84,22 +89,10 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
             "schemas": {
                 "ContentPart": content_part_schema(),
                 "ToolError": tool_error_schema(),
-                "StructuredContent": structured_content_schema(),
-                "ToolExecutionResponse": {
-                    "type": "object",
-                    "properties": {
-                        "ok": { "type": "boolean" },
-                        "tool": { "type": "string" },
-                        "structured_content": { "$ref": "#/components/schemas/StructuredContent" },
-                        "content": {
-                            "type": "array",
-                            "items": { "$ref": "#/components/schemas/ContentPart" }
-                        },
-                        "is_error": { "type": "boolean" }
-                    },
-                    "required": ["ok", "tool", "is_error"],
-                    "additionalProperties": true
-                }
+                "StructuredContent": default_structured_content_schema(),
+                "ToolExecutionResponse": tool_execution_response_schema(
+                    json!({ "$ref": "#/components/schemas/StructuredContent" })
+                )
             }
         }
     });
@@ -157,7 +150,25 @@ fn tool_error_schema() -> Value {
     })
 }
 
-fn structured_content_schema() -> Value {
+fn tool_execution_response_schema(structured_content: Value) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ok": { "type": "boolean" },
+            "tool": { "type": "string" },
+            "structured_content": structured_content,
+            "content": {
+                "type": "array",
+                "items": { "$ref": "#/components/schemas/ContentPart" }
+            },
+            "is_error": { "type": "boolean" }
+        },
+        "required": ["ok", "tool", "is_error"],
+        "additionalProperties": true
+    })
+}
+
+fn default_structured_content_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -229,6 +240,21 @@ mod tests {
         assert_eq!(
             operation["requestBody"]["content"]["application/json"]["schema"],
             crate::tools::registry::input_schema("grep_text")
+        );
+    }
+
+    #[test]
+    fn core_openapi_uses_tool_output_schema_for_apply_patch() {
+        let tools = crate::tools::list_tools_for_profile("core");
+        let schema = build_openapi(&tools, "https://actions.example.com", "none");
+        let structured = &schema["paths"]["/actions/apply_patch"]["post"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["properties"]["structured_content"];
+
+        assert_eq!(structured["type"], "object");
+        assert_eq!(structured["required"], json!(["ok"]));
+        assert_eq!(
+            structured["properties"]["affected_files"]["items"]["properties"]["operation"]["enum"],
+            json!(["add", "update", "delete"])
         );
     }
 }

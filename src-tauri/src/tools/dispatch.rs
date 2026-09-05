@@ -385,7 +385,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "history_session_validate" => history::validate(ctx, &effective_args),
         "history_session_search" => history::search(ctx, &effective_args),
         "history_session_read" => history::read(ctx, &effective_args),
-        "capability_health_check" => Ok(capability_health_check(ctx)),
+        "capability_health_check" => Ok(tool_ok(capability_health_check(ctx))),
         "planning_state" => planning::planning_state(ctx, &effective_args),
         "create_goal" => planning::create_goal(ctx, &effective_args),
         "update_goal" => planning::update_goal(ctx, &effective_args),

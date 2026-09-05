@@ -6,6 +6,7 @@ pub mod git;
 pub mod history;
 mod image_tool;
 pub mod manage;
+mod output_schema;
 pub mod patch;
 pub mod planning;
 pub mod policy;
@@ -18,6 +19,7 @@ pub use context::{SharedToolContext, ToolContext};
 /// 唯一工具执行入口；MCP 与 Actions 必须调用此函数，不得分叉实现。
 pub use dispatch::call_tool;
 pub use policy::{validate_actions_exposure, PolicySettings};
+pub use output_schema::output_schema;
 pub use registry::{
     exposed_tool_names, is_allowed_tool, list_tools, list_tools_for_profile, MUTATING_TOOLS,
 };
