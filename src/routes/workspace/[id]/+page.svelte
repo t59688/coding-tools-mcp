@@ -15,6 +15,7 @@
   import ChatGptSessionPrompt from "$lib/components/ChatGptSessionPrompt.svelte";
   import PlanningControlPanel from "$lib/components/PlanningControlPanel.svelte";
   import ServicePanel from "$lib/components/ServicePanel.svelte";
+  import McpRecentCallsCard from "$lib/components/McpRecentCallsCard.svelte";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
   import Tabs from "$lib/components/Tabs.svelte";
@@ -36,6 +37,13 @@
     stopRuntime,
     updateWorkspace,
   } from "$lib/api/workspaces";
+  import {
+    emptyLastCallAges,
+    getServiceUsageStats,
+    lastCallAgesFromStats,
+    type LastCallAges,
+    type RecentMcpCall,
+  } from "$lib/api/usage";
   import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "$lib/api/settings";
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { restartTunnel, stopTunnel } from "$lib/api/tunnel";
@@ -74,6 +82,9 @@
   let actionsLocal = $state("");
   let actionsPublic = $state("");
   let frpProfiles = $state<FrpProfileDto[]>([]);
+  let mcpCallAges = $state<LastCallAges>(emptyLastCallAges());
+  let actionsCallAges = $state<LastCallAges>(emptyLastCallAges());
+  let mcpRecentCalls = $state<RecentMcpCall[]>([]);
 
   let activeWorkspaceTab = $state<WorkspaceTab>("overview");
   let mcpSubTab = $state<SubTab>("config");
@@ -573,6 +584,38 @@
       loadGeneration += 1;
     };
   });
+
+  $effect(() => {
+    const id = workspaceId;
+    if (!id) return;
+    const workspaceKey = id;
+    let cancelled = false;
+
+    async function refreshCallAges() {
+      try {
+        const stats = await getServiceUsageStats(workspaceKey);
+        if (cancelled || workspaceKey !== workspaceId) return;
+        const mcpStats = stats.find((item) => item.service === "mcp");
+        mcpCallAges = lastCallAgesFromStats(mcpStats);
+        actionsCallAges = lastCallAgesFromStats(stats.find((item) => item.service === "actions"));
+        mcpRecentCalls = mcpStats?.recentCalls ?? [];
+      } catch {
+        if (cancelled || workspaceKey !== workspaceId) return;
+        mcpCallAges = emptyLastCallAges();
+        actionsCallAges = emptyLastCallAges();
+        mcpRecentCalls = [];
+      }
+    }
+
+    void refreshCallAges();
+    const timer = window.setInterval(() => {
+      void refreshCallAges();
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  });
 </script>
 
 {#if profile && actions}
@@ -725,9 +768,12 @@
             publicEndpoint={mcpPublic}
             publicLabel="公网 MCP"
             showToggle={false}
+            lastSuccessAtMs={mcpCallAges.lastSuccessAtMs}
+            lastFailureAtMs={mcpCallAges.lastFailureAtMs}
             onToggle={toggleMcp}
             onPortChange={saveMcpPort}
           />
+          <McpRecentCallsCard calls={mcpRecentCalls} />
           <GptQuickCopy
             workspaceId={workspaceId!}
             service="mcp"
@@ -846,6 +892,8 @@
             publicEndpoint={actionsPublic || actionsOpenApiUrl(profile, frpProfiles)}
             publicLabel="OpenAPI"
             showToggle={false}
+            lastSuccessAtMs={actionsCallAges.lastSuccessAtMs}
+            lastFailureAtMs={actionsCallAges.lastFailureAtMs}
             onToggle={toggleActions}
             onPortChange={saveActionsPort}
           />

@@ -2101,6 +2101,47 @@ button:disabled {
   min-width: 0;
 }
 
+.tx-call-age-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.tx-recent-call-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tx-recent-call-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.tx-recent-call-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-success);
+}
+
+.tx-recent-call-dot.error {
+  background: var(--color-error);
+}
+
+.tx-recent-call-time {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
 .tx-empty-state {
   display: flex;
   width: min(560px, 100%);
@@ -2287,6 +2328,10 @@ button:disabled {
   }
 
   .tx-service-info-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tx-call-age-grid {
     grid-template-columns: 1fr;
   }
 }

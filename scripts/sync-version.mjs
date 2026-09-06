@@ -42,7 +42,7 @@ writeFileSync(cargoTomlPath, updatedCargoToml);
 const cargoLockPath = resolve(projectRoot, "src-tauri/Cargo.lock");
 const cargoLock = readFileSync(cargoLockPath, "utf8");
 const updatedCargoLock = cargoLock.replace(
-  /(\[\[package\]\]\nname = "coding-tools-mcp-desktop"\nversion = ")[^"]+("\n)/,
+  /(\[\[package\]\]\r?\nname = "coding-tools-mcp-desktop"\r?\nversion = ")[^"]+("\r?\n)/,
   `$1${version}$2`,
 );
 if (updatedCargoLock === cargoLock) {

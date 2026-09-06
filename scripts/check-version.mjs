@@ -16,7 +16,7 @@ const cargoLock = readFileSync(resolve(projectRoot, "src-tauri/Cargo.lock"), "ut
 
 const cargoTomlVersion = cargoToml.match(/^version = "([^"]+)"$/m)?.[1];
 const cargoLockVersion = cargoLock.match(
-  /\[\[package\]\]\nname = "coding-tools-mcp-desktop"\nversion = "([^"]+)"/,
+  /\[\[package\]\]\r?\nname = "coding-tools-mcp-desktop"\r?\nversion = "([^"]+)"/,
 )?.[1];
 
 const versions = {

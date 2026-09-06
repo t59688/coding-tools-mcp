@@ -269,6 +269,7 @@ async fn mcp_post(
     Json(body): Json<Value>,
 ) -> Response {
     if let Some(response) = require_mcp_auth(&state, &headers) {
+        state.mcp.usage().mark_failure();
         return response;
     }
     let method = body
@@ -316,6 +317,7 @@ async fn mcp_post(
                 method == "tools/call",
                 is_error,
             );
+            state.mcp.usage().remember(&method, &tool_name, is_error);
             let audit = audit_state.context_audit_snapshot();
             let repeated_bytes = audit
                 .get("repeated_bytes")
@@ -404,6 +406,7 @@ async fn mcp_post(
                 method == "tools/call",
                 true,
             );
+            state.mcp.usage().remember(&method, &tool_name, true);
             append_profile_log(
                 &profile_id,
                 "mcp-requests.log",

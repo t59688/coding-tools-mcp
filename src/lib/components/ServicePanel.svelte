@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
+  import { formatCallAge } from "$lib/api/usage";
   import type { RuntimeState } from "$lib/types";
 
   interface Props {
@@ -16,6 +18,8 @@
     publicEndpoint?: string;
     publicLabel?: string;
     showToggle?: boolean;
+    lastSuccessAtMs?: number | null;
+    lastFailureAtMs?: number | null;
     onToggle: () => void | Promise<void>;
     onPortChange?: (port: number) => void | Promise<void>;
   }
@@ -33,15 +37,28 @@
     publicEndpoint = "",
     publicLabel = "公网",
     showToggle = true,
+    lastSuccessAtMs = null,
+    lastFailureAtMs = null,
     onToggle,
     onPortChange,
   }: Props = $props();
 
   let draftPort = $state(0);
+  let nowMs = $state(Date.now());
 
   $effect(() => {
     draftPort = port;
   });
+
+  onMount(() => {
+    const timer = window.setInterval(() => {
+      nowMs = Date.now();
+    }, 1000);
+    return () => window.clearInterval(timer);
+  });
+
+  const lastSuccessLabel = $derived(formatCallAge(lastSuccessAtMs, nowMs));
+  const lastFailureLabel = $derived(formatCallAge(lastFailureAtMs, nowMs));
 
   const running = $derived(status === "running");
   const showError = $derived(status === "error" && Boolean(statusMessage));
@@ -140,5 +157,16 @@
         </p>
       </div>
     {/if}
+  </div>
+
+  <div class="tx-call-age-grid mt-4">
+    <div class="tx-info-block">
+      <span class="tx-info-label">上次成功调用</span>
+      <p class="tx-mono mt-1.5 text-sm">{lastSuccessLabel}</p>
+    </div>
+    <div class="tx-info-block">
+      <span class="tx-info-label">上次失败调用</span>
+      <p class="tx-mono mt-1.5 text-sm">{lastFailureLabel}</p>
+    </div>
   </div>
 </article>
