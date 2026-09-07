@@ -57,4 +57,3 @@ scratch/
 *.local.yml
 
 .worktrees/
-.worktrees/fix-patch-default-cwd

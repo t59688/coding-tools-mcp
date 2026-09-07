@@ -12,6 +12,12 @@
   let busy = $state(false);
   let error = $state("");
 
+  $effect(() => {
+    workspaceId;
+    items = [];
+    error = "";
+  });
+
   async function runCheck() {
     if (busy || !workspaceId) return;
     busy = true;

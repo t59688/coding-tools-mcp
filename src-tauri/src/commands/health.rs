@@ -2,7 +2,10 @@ use tauri::State;
 
 use crate::app_state::AppState;
 use crate::error::{AppError, AppResult};
-use crate::health::{run_health_checks as execute_health_checks, HealthItem};
+use crate::health::{
+    probe_mcp_wan_access as execute_wan_probe, run_health_checks as execute_health_checks,
+    HealthItem, WanProbeResult,
+};
 
 fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::WorkspaceProfile> {
     state.with_workspaces(|store| {
@@ -17,4 +20,13 @@ fn profile_by_id(state: &AppState, id: &str) -> AppResult<crate::workspace::Work
 pub async fn run_health_checks(state: State<'_, AppState>, id: String) -> AppResult<Vec<HealthItem>> {
     let profile = profile_by_id(&state, &id)?;
     Ok(execute_health_checks(&profile).await)
+}
+
+#[tauri::command]
+pub async fn probe_mcp_wan_access(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<WanProbeResult> {
+    let profile = profile_by_id(&state, &id)?;
+    Ok(execute_wan_probe(&profile).await)
 }

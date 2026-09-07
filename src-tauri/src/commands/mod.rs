@@ -25,7 +25,7 @@ pub use frp_profiles::{
     save_frp_profile, set_last_workspace, set_proxy,
 };
 pub use global_gateway::{check_global_gateway_health, get_global_gateway_config, get_global_gateway_status, set_global_gateway_config, start_global_gateway, stop_global_gateway};
-pub use health::run_health_checks;
+pub use health::{probe_mcp_wan_access, run_health_checks};
 pub use history::list_history_sessions;
 pub use logs::read_workspace_logs;
 pub use planning::{

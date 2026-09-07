@@ -7,6 +7,7 @@
   } from "$lib/components/ActionsPolicyForm.svelte";
   import AuthConfigForm from "$lib/components/AuthConfigForm.svelte";
   import HealthPanel from "$lib/components/HealthPanel.svelte";
+  import WanProbePanel from "$lib/components/WanProbePanel.svelte";
   import HistoryContextPanel from "$lib/components/HistoryContextPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
   import RuntimePolicyForm, {
@@ -873,7 +874,8 @@
             <LogViewer workspaceId={workspaceId!} service="mcp" />
           </div>
         {:else}
-          <div class="mt-4 tx-card p-4">
+          <div class="mt-4 grid gap-4">
+            <WanProbePanel workspaceId={workspaceId!} />
             <HealthPanel workspaceId={workspaceId!} />
           </div>
         {/if}
