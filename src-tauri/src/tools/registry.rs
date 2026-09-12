@@ -46,7 +46,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "task_manage",
         "Task manager",
-        "Stable Tool API v2 entry point for durable task state, lifecycle, events, and change summaries.",
+        "Stable Tool API v2 entry point for durable task state, lifecycle, baseline recovery, events, and change summaries.",
         false,
         false,
         false,
@@ -507,7 +507,7 @@ fn task_manage_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "action": { "type": "string", "enum": ["status", "operation_log", "project_state", "start", "update", "pause", "resume", "finish", "context", "events", "change_summary"] },
+            "action": { "type": "string", "enum": ["status", "operation_log", "project_state", "start", "update", "pause", "resume", "refresh_baseline", "finish", "context", "events", "change_summary"] },
             "task_id": { "type": "string", "minLength": 1 },
             "objective": { "type": "string", "minLength": 1 },
             "completed_steps": { "type": "array", "items": { "type": "string" } },
@@ -1413,5 +1413,11 @@ mod tests {
         assert!(!names.contains(&"list_skills"));
         assert!(!names.contains(&"request_permissions"));
         assert_eq!(tool_api_descriptor()["version"], "2");
+
+        let task_actions = input_schema("task_manage")["properties"]["action"]["enum"]
+            .as_array()
+            .expect("task action enum")
+            .clone();
+        assert!(task_actions.iter().any(|action| action == "refresh_baseline"));
     }
 }

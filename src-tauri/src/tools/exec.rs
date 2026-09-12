@@ -244,6 +244,12 @@ async fn run_command(
         search_path.as_deref(),
     )?;
     let start = Instant::now();
+    // A durable Harness task treats one non-interactive exec as one atomic tracked
+    // operation. Do not yield a still-running child and then freeze a partial
+    // fingerprint: the child may legitimately keep writing the workspace after
+    // the tool response (notably WSL installers/downloaders on a Windows host).
+    // Standalone and interactive sessions keep the existing retained-session UX.
+    let wait_for_task_completion = !tty && ctx.harness.current_task().ok().flatten().is_some();
 
     let mut command = command_for_program(&program, &args);
     if let Some(path) = search_path.as_ref() {
@@ -277,7 +283,7 @@ async fn run_command(
     session.spawn_readers().await;
     let deadline = start + limit;
 
-    if yield_time.is_zero() {
+    if yield_time.is_zero() && !wait_for_task_completion {
         let snapshot = session.snapshot(max_output);
         spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
         return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
@@ -333,7 +339,7 @@ async fn run_command(
                 }),
             });
         }
-        if Instant::now() - start >= yield_time || tty {
+        if !wait_for_task_completion && (Instant::now() - start >= yield_time || tty) {
             let snapshot = session.snapshot(max_output);
             spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));

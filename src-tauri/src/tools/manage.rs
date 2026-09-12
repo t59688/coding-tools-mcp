@@ -49,6 +49,7 @@ pub fn task_manage(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         "update" => "update_task",
         "pause" => "pause_task",
         "resume" => "resume_task",
+        "refresh_baseline" => "refresh_baseline",
         "finish" => "finish_task",
         "context" => "task_context",
         "events" => "list_task_events",
@@ -69,7 +70,7 @@ pub fn action_is_mutating(name: &str, args: &Value) -> Option<bool> {
         "planning_manage" => Some(!matches!(action, "state")),
         "task_manage" => Some(matches!(
             action,
-            "start" | "update" | "pause" | "resume" | "finish"
+            "start" | "update" | "pause" | "resume" | "refresh_baseline" | "finish"
         )),
         _ => None,
     }
