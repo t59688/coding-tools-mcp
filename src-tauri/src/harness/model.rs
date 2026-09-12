@@ -42,11 +42,15 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
-    pub fn is_writable(self) -> bool {
+    pub fn is_open(self) -> bool {
         matches!(
             self,
             Self::Active | Self::Paused | Self::Verifying | Self::Failed
         )
+    }
+
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Active | Self::Verifying | Self::Failed)
     }
 
     pub fn can_transition_to(self, next: Self) -> bool {
