@@ -157,10 +157,13 @@ impl Harness {
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
         let task = self.task(task_id)?;
         let current = capture_baseline(&self.workspace_root);
-        if current.branch != task.baseline.branch || current.head != task.baseline.head {
+        // The branch is the Git trust boundary. A same-branch HEAD move (for example,
+        // committing task output or an empty metadata commit) is safe when the exact
+        // workspace fingerprint still matches the state Harness already accepted.
+        if current.branch != task.baseline.branch {
             return Err(HarnessError::new(
                 "BASELINE_STALE",
-                "Git 分支或 HEAD 已发生变化",
+                "Git 分支已发生变化",
             ));
         }
         if current.worktree_fingerprint != task.expected_fingerprint {
@@ -332,7 +335,6 @@ impl Harness {
             match task.as_ref() {
                 Some(task) => {
                     let matches = task.baseline.branch == current.branch
-                        && task.baseline.head == current.head
                         && task.expected_fingerprint == current.worktree_fingerprint;
                     let reason = if matches {
                         "任务可继续执行"
@@ -434,7 +436,16 @@ impl Harness {
         } else if baseline_matches == Some(false) {
             next_actions.push("project_state".into());
             next_actions.push("git_diff".into());
-            next_actions.push("refresh_baseline".into());
+            if task
+                .as_ref()
+                .is_some_and(|task| task.baseline.branch == current.branch)
+            {
+                // Both actions are deliberate: refresh_baseline is preferred by new
+                // clients, while resume remains callable by clients with a cached v2
+                // task_manage schema that predates refresh_baseline.
+                next_actions.push("refresh_baseline".into());
+                next_actions.push("resume_task".into());
+            }
         } else if !writable {
             next_actions.push("resume_task".into());
         }
