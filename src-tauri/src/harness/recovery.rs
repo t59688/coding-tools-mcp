@@ -9,10 +9,12 @@ use super::Harness;
 /// Persist a user-reviewed worktree as the task's new expected state.
 ///
 /// The immutable task-start baseline (branch, HEAD, and original entries) is never
-/// rewritten. Callers may provide the exact worktree fingerprint they reviewed;
-/// when present, the current worktree must still match it at the moment we persist
-/// the acceptance. This turns the fingerprint into an optimistic-concurrency token
-/// and prevents a later, unreviewed edit from being silently blessed.
+/// rewritten. The branch remains the Git trust boundary; a same-branch HEAD move is
+/// acceptable only when callers explicitly accept the exact worktree fingerprint
+/// they reviewed. When a fingerprint is supplied, the current worktree must still
+/// match it at the moment we persist the acceptance. This turns the fingerprint into
+/// an optimistic-concurrency token and prevents a later, unreviewed edit from being
+/// silently blessed.
 pub fn accept_reviewed_baseline(
     harness: &Harness,
     workspace_root: &Path,
@@ -22,10 +24,10 @@ pub fn accept_reviewed_baseline(
     let mut task = harness.task(task_id)?;
     let current = capture_baseline(workspace_root);
 
-    if current.branch != task.baseline.branch || current.head != task.baseline.head {
+    if current.branch != task.baseline.branch {
         return Err(HarnessError::new(
             "BASELINE_STALE",
-            "Git 分支或 HEAD 已发生变化；不能通过工作区基线恢复静默接受新的 Git revision",
+            "Git 分支已发生变化；不能通过工作区基线恢复接受跨分支 revision",
         ));
     }
 
