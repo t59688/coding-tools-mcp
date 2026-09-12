@@ -177,6 +177,11 @@ fn planning_protected_tool(name: &str, args: &Value) -> bool {
     if name == "history_manage" || name == "planning_manage" {
         return false;
     }
+    if name == "task_manage"
+        && args.get("action").and_then(Value::as_str) == Some("refresh_baseline")
+    {
+        return false;
+    }
     mutating_tool_call(name, args) && !EXEMPT.contains(&name)
 }
 
@@ -799,7 +804,27 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
     let exposed = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
     actions
         .into_iter()
-        .filter(|action| exposed.contains(&action.as_str()))
+        .filter_map(|action| {
+            if exposed.contains(&action.as_str()) {
+                return Some(action);
+            }
+            if exposed.contains(&"task_manage") {
+                let stable = match action.as_str() {
+                    "start_task" => Some("task_manage:start"),
+                    "project_state" => Some("task_manage:project_state"),
+                    "resume_task" => Some("task_manage:resume"),
+                    "refresh_baseline" => Some("task_manage:refresh_baseline"),
+                    _ => None,
+                };
+                if let Some(stable) = stable {
+                    return Some(stable.to_string());
+                }
+            }
+            action
+                .split_once(':')
+                .filter(|(tool, _)| exposed.contains(tool))
+                .map(|_| action)
+        })
         .collect()
 }
 
@@ -906,7 +931,34 @@ mod planning_tests {
 
         assert!(planning_gate(&state, "planning_manage", &json!({"action":"state"})).is_none());
         assert!(planning_gate(&state, "task_manage", &json!({"action":"context"})).is_none());
+        assert!(planning_gate(&state, "task_manage", &json!({"action":"refresh_baseline"})).is_none());
         assert!(planning_gate(&state, "task_manage", &json!({"action":"start"})).is_some());
+    }
+
+    #[test]
+    fn compact_recovery_actions_are_projected_to_stable_manager_calls() {
+        let (_workspace, _harness, ctx) = context();
+        let ctx = ctx.with_tool_profile("compact");
+        let actions = filter_exposed_actions(
+            &ctx,
+            vec![
+                "project_state".into(),
+                "git_diff".into(),
+                "refresh_baseline".into(),
+                "read_file".into(),
+                "git_status".into(),
+            ],
+        );
+        assert_eq!(
+            actions,
+            vec![
+                "task_manage:project_state",
+                "git_diff",
+                "task_manage:refresh_baseline",
+                "read_file",
+                "git_status",
+            ]
+        );
     }
 
     #[test]

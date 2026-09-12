@@ -83,6 +83,16 @@ task_manage
 - **Harness Task**：可恢复执行任务、操作事件和工作区基线；
 - **History**：对话与开发事实的长期无损归档。
 
+Harness Task 保存两层工作区状态：`task.baseline` 是任务开始时的不可变审计基线；`expected_fingerprint` 是 Harness 已知并接受的当前工作区状态。受 Harness 跟踪的非交互 `exec_command` 在进程真正退出或超时前不会提前 yield，避免把仍在写入工作区的 WSL/安装子进程误判成后续外部修改。无 Task 的 standalone exec 与显式交互 TTY 仍保留可继续读取的 session 行为。
+
+如果 Harness 检测到当前工作区与 `expected_fingerprint` 不一致，会 fail-closed 暂停写入和执行。审查 `task_manage(action="project_state")` / `git_diff` 后，可以显式调用：
+
+```text
+task_manage(action="refresh_baseline", task_id="...")
+```
+
+该恢复动作只接受当前活动 Task、且 Git branch/HEAD 必须仍与原始任务基线一致；它仅更新 `expected_fingerprint`，不会覆盖原始 `task.baseline`，并写入 `task_baseline_refreshed` 审计事件。因此不需要通过 Git reset 或删除用户文件来恢复 Harness。
+
 统一的 **Execution Ledger** 位于 Planning State 顶层，投影当前：
 
 ```text

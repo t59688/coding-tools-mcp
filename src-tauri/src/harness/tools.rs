@@ -4,6 +4,7 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::ToolContext;
 
 use super::model::TaskStatus;
+use super::state::capture_baseline;
 use super::store::HarnessError;
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -29,6 +30,7 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
         "update_task" => update_task(ctx, args),
         "pause_task" => transition(ctx, args, TaskStatus::Paused),
         "resume_task" => transition(ctx, args, TaskStatus::Active),
+        "refresh_baseline" => refresh_baseline(ctx, args),
         "finish_task" => finish_task(ctx, args),
         "task_context" => task_context(ctx, args),
         "list_task_events" => list_task_events(ctx, args),
@@ -39,8 +41,19 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
 }
 
 fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
-    serde_json::to_value(ctx.harness.status().map_err(map_error)?)
-        .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
+    let mut status = ctx.harness.status().map_err(map_error)?;
+    status.next_actions = status
+        .next_actions
+        .into_iter()
+        .map(|action| match action.as_str() {
+            "start_task" => "task_manage:start".to_string(),
+            "project_state" => "task_manage:project_state".to_string(),
+            "resume_task" => "task_manage:resume".to_string(),
+            "refresh_baseline" => "task_manage:refresh_baseline".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    serde_json::to_value(status).map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
 }
 
 fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -72,7 +85,7 @@ fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
     let task = ctx.harness.start_task(objective).map_err(map_error)?;
-    Ok(json!({"task": task, "next": ["project_state", "task_context"]}))
+    Ok(json!({"task": task, "next": ["task_manage:project_state", "task_manage:context"]}))
 }
 
 fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -96,6 +109,67 @@ fn transition(
         .transition(task_id(args)?, status)
         .map_err(map_error)?;
     Ok(json!({"task": task}))
+}
+
+/// Accept the currently reviewed worktree as the task's expected state without
+/// rewriting the immutable task-start baseline. This is intentionally explicit:
+/// branch/HEAD changes are never blessed by this recovery action.
+fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let requested_task_id = task_id(args)?;
+    let active_task = ctx
+        .harness
+        .current_task()
+        .map_err(map_error)?
+        .ok_or_else(|| tool_error("TASK_STATE_REQUIRED", "当前没有可刷新基线的活动任务"))?;
+    if active_task.id != requested_task_id {
+        return Err(tool_error(
+            "TASK_STATE_REQUIRED",
+            "只能刷新当前活动任务的工作区基线",
+        ));
+    }
+
+    let current = capture_baseline(ctx.workspace.root());
+    if current.branch != active_task.baseline.branch || current.head != active_task.baseline.head {
+        return Err(tool_error(
+            "BASELINE_STALE",
+            "Git 分支或 HEAD 已发生变化；请先审查版本变化，不能通过 refresh_baseline 静默接受",
+        ));
+    }
+
+    let previous_expected_fingerprint = active_task.expected_fingerprint.clone();
+    let accepted_worktree_fingerprint = current.worktree_fingerprint.clone();
+    let refreshed = ctx
+        .harness
+        .refresh_expected_state(requested_task_id)
+        .map_err(map_error)?;
+    let expected_fingerprint = refreshed.expected_fingerprint.clone();
+    let event = ctx
+        .harness
+        .record_event(
+            requested_task_id,
+            "task_baseline_refreshed",
+            Some("refresh_baseline"),
+            json!({"source": "task_manage"}),
+            json!({
+                "ok": true,
+                "previous_expected_fingerprint": previous_expected_fingerprint.clone(),
+                "expected_fingerprint": expected_fingerprint.clone(),
+                "branch": current.branch.clone(),
+                "head": current.head.clone()
+            }),
+        )
+        .map_err(map_error)?;
+    let status = harness_status(ctx)?;
+
+    Ok(json!({
+        "task": refreshed,
+        "baseline_refreshed": true,
+        "previous_expected_fingerprint": previous_expected_fingerprint,
+        "accepted_worktree_fingerprint": accepted_worktree_fingerprint,
+        "event_id": event.id,
+        "status": status,
+        "warning": "当前工作区已接受为任务预期状态；原始 task.baseline 保持不变"
+    }))
 }
 
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
