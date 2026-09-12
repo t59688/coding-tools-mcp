@@ -81,6 +81,8 @@ pub struct BaselineEntry {
     pub is_binary: bool,
     pub sha256: String,
     pub bytes: u64,
+    #[serde(default)]
+    pub modified_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,8 @@ pub struct TaskSession {
     pub status: TaskStatus,
     pub baseline: ProjectBaseline,
     pub expected_fingerprint: String,
+    #[serde(default)]
+    pub expected_baseline: Option<ProjectBaseline>,
     #[serde(default)]
     pub completed_steps: Vec<String>,
     #[serde(default)]
