@@ -30,6 +30,14 @@ fn git(workspace: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn init_git(workspace: &std::path::Path) {
+    git(workspace, &["init"]);
+    git(workspace, &["config", "user.email", "harness@example.com"]);
+    git(workspace, &["config", "user.name", "Harness Test"]);
+    git(workspace, &["add", "README.md"]);
+    git(workspace, &["commit", "-m", "initial"]);
+}
+
 #[test]
 fn reviewed_worktree_advertises_stale_schema_resume_recovery() {
     let (_temp, workspace, ctx) = fixture();
@@ -55,38 +63,63 @@ fn reviewed_worktree_advertises_stale_schema_resume_recovery() {
         true,
         "status: {status}"
     );
+    assert_eq!(status["recovery"]["requires_summary"], true);
+    assert!(status["recovery"]["change_id"].as_str().is_some());
 
     let next_actions = status["next_actions"]
         .as_array()
         .expect("next_actions array");
-    assert!(
-        next_actions
-            .iter()
-            .any(|action| action == "task_manage:refresh_baseline"),
-        "new clients need the preferred recovery action: {status}"
-    );
-    assert!(
-        next_actions
-            .iter()
-            .any(|action| action == "task_manage:resume"),
-        "stale-schema clients need the compatibility recovery action to be discoverable: {status}"
-    );
+    assert!(next_actions
+        .iter()
+        .any(|action| action == "task_manage:refresh_baseline"));
+    assert!(next_actions
+        .iter()
+        .any(|action| action == "task_manage:resume"));
 }
 
 #[test]
-fn git_revision_drift_does_not_advertise_baseline_acceptance_actions() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let workspace = temp.path().join("workspace");
-    fs::create_dir_all(&workspace).expect("create workspace");
-    fs::write(workspace.join("README.md"), "initial\n").expect("write initial file");
-    git(&workspace, &["init"]);
-    git(&workspace, &["config", "user.email", "harness@example.com"]);
-    git(&workspace, &["config", "user.name", "Harness Test"]);
-    git(&workspace, &["add", "README.md"]);
-    git(&workspace, &["commit", "-m", "initial"]);
+fn same_branch_committed_head_drift_remains_review_recoverable() {
+    let (temp, workspace, _ctx) = fixture();
+    init_git(&workspace);
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("git-harness"))
+        .expect("create git context")
+        .with_tool_profile("compact");
+    let started = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "start", "objective": "discover committed recovery"}),
+    );
+    assert_eq!(started["ok"], true);
 
-    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("harness"))
-        .expect("create tool context")
+    fs::write(workspace.join("README.md"), "committed change\n").expect("change file");
+    git(&workspace, &["add", "README.md"]);
+    git(&workspace, &["commit", "-m", "same branch change"]);
+
+    let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
+    assert_eq!(status["baseline_matches"], false, "status: {status}");
+    assert_eq!(status["recovery"]["type"], "reviewed_worktree_baseline");
+    assert_eq!(status["recovery"]["head_changed"], true);
+    assert_eq!(
+        status["recovery"]["recoverable_via_baseline_acceptance"], true
+    );
+    assert!(status["next_actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .any(|action| action == "task_manage:refresh_baseline"));
+    assert!(status["next_actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .any(|action| action == "task_manage:resume"));
+}
+
+#[test]
+fn branch_revision_drift_does_not_advertise_baseline_acceptance_actions() {
+    let (temp, workspace, _ctx) = fixture();
+    init_git(&workspace);
+    let ctx = ToolContext::for_test(workspace.clone(), temp.path().join("branch-harness"))
+        .expect("create git context")
         .with_tool_profile("compact");
     let started = call_tool(
         &ctx,
@@ -95,43 +128,27 @@ fn git_revision_drift_does_not_advertise_baseline_acceptance_actions() {
     );
     assert_eq!(started["ok"], true, "start task: {started}");
 
-    fs::write(workspace.join("README.md"), "external revision\n").expect("change file");
-    git(&workspace, &["add", "README.md"]);
-    git(&workspace, &["commit", "-m", "external revision"]);
+    git(&workspace, &["checkout", "-b", "other-branch"]);
+    fs::write(workspace.join("README.md"), "other branch\n").expect("change file");
 
     let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
     assert_eq!(status["ok"], true, "status: {status}");
     assert_eq!(status["baseline_matches"], false, "status: {status}");
+    assert_eq!(status["recovery"]["type"], "git_revision_drift");
     assert_eq!(
-        status["recovery"]["type"],
-        "git_revision_drift",
-        "status: {status}"
-    );
-    assert_eq!(
-        status["recovery"]["recoverable_via_baseline_acceptance"],
-        false,
-        "status: {status}"
+        status["recovery"]["recoverable_via_baseline_acceptance"], false
     );
 
     let next_actions = status["next_actions"]
         .as_array()
         .expect("next_actions array");
-    assert!(
-        next_actions
-            .iter()
-            .all(|action| action != "task_manage:refresh_baseline"),
-        "refresh_baseline must never be suggested across Git revision drift: {status}"
-    );
-    assert!(
-        next_actions
-            .iter()
-            .all(|action| action != "task_manage:resume"),
-        "resume compatibility recovery must never be suggested across Git revision drift: {status}"
-    );
-    assert!(
-        next_actions
-            .iter()
-            .any(|action| action == "task_manage:project_state"),
-        "revision drift must direct clients to review project state: {status}"
-    );
+    assert!(next_actions
+        .iter()
+        .all(|action| action != "task_manage:refresh_baseline"));
+    assert!(next_actions
+        .iter()
+        .all(|action| action != "task_manage:resume"));
+    assert!(next_actions
+        .iter()
+        .any(|action| action == "task_manage:project_state"));
 }

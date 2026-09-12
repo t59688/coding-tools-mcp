@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 
 use super::model::{
     BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus, OperationRecord,
-    ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
-    TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
+    ProjectBaseline, ProjectFileState, ProjectState, TaskSession, TaskStatus, WorkspaceHarnessState,
+    SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
 use crate::tools::workspace::DEFAULT_EXCLUDED_NAMES;
@@ -95,7 +95,7 @@ impl Harness {
             .store
             .list_tasks(&self.workspace_id)?
             .into_iter()
-            .find(|task| task.status.is_writable()))
+            .find(|task| task.status.is_open()))
     }
 
     pub fn task(&self, task_id: &str) -> HarnessResult<TaskSession> {
@@ -113,7 +113,7 @@ impl Harness {
         task.status = next;
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
-        if !task.status.is_writable() {
+        if !task.status.is_open() {
             self.save_workspace_state(None, &task.updated_at)?;
         }
         self.record_event(
@@ -157,11 +157,8 @@ impl Harness {
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
         let task = self.task(task_id)?;
         let current = capture_baseline(&self.workspace_root);
-        if current.branch != task.baseline.branch || current.head != task.baseline.head {
-            return Err(HarnessError::new(
-                "BASELINE_STALE",
-                "Git 分支或 HEAD 已发生变化",
-            ));
+        if current.branch != task.baseline.branch {
+            return Err(HarnessError::new("BASELINE_STALE", "Git 分支已发生变化"));
         }
         if current.worktree_fingerprint != task.expected_fingerprint {
             return Err(HarnessError::new(
@@ -332,18 +329,22 @@ impl Harness {
             match task.as_ref() {
                 Some(task) => {
                     let matches = task.baseline.branch == current.branch
-                        && task.baseline.head == current.head
                         && task.expected_fingerprint == current.worktree_fingerprint;
-                    let reason = if matches {
+                    let writable = matches && task.status.is_writable();
+                    let reason = if !matches {
+                        "工作区基线已变化，写入和执行已暂停"
+                    } else if task.status == TaskStatus::Paused {
+                        "任务已暂停；读取和任务管理仍可用，工作区写入和执行已禁用"
+                    } else if writable {
                         "任务可继续执行"
                     } else {
-                        "工作区基线已变化，写入和执行已暂停"
+                        "任务当前状态不允许工作区写入或执行"
                     };
                     (
                         Some(task.id.clone()),
                         Some(task.status),
                         Some(task.updated_at.clone()),
-                        matches && task.status.is_writable(),
+                        writable,
                         Some(matches),
                         reason.to_string(),
                     )
@@ -357,6 +358,14 @@ impl Harness {
                     "当前没有活动任务，工作区采用无任务模式；修改不会进入任务事件流".to_string(),
                 ),
             };
+
+        let denied_reason = if baseline_matches == Some(false) {
+            "工作区基线不匹配；必须先审查并显式恢复"
+        } else if task_state == Some(TaskStatus::Paused) {
+            "任务已暂停；请先恢复任务后再修改或执行"
+        } else {
+            "当前任务状态不允许工作区写入或执行"
+        };
 
         let mut capabilities = HashMap::new();
         capabilities.insert(
@@ -378,7 +387,7 @@ impl Harness {
                         "无任务模式允许直接修改，建议需要长期追踪时调用 start_task"
                     }
                 } else {
-                    "需要活动任务且工作区基线必须匹配"
+                    denied_reason
                 }
                 .into(),
                 recoverable: true,
@@ -395,7 +404,7 @@ impl Harness {
                         "无任务模式允许直接执行，建议需要长期追踪时调用 start_task"
                     }
                 } else {
-                    "需要活动任务且工作区基线必须匹配"
+                    denied_reason
                 }
                 .into(),
                 recoverable: true,
@@ -434,7 +443,13 @@ impl Harness {
         } else if baseline_matches == Some(false) {
             next_actions.push("project_state".into());
             next_actions.push("git_diff".into());
-            next_actions.push("refresh_baseline".into());
+            if task
+                .as_ref()
+                .is_some_and(|task| task.baseline.branch == current.branch)
+            {
+                next_actions.push("refresh_baseline".into());
+                next_actions.push("resume_task".into());
+            }
         } else if !writable {
             next_actions.push("resume_task".into());
         }
@@ -754,6 +769,30 @@ mod tests {
         assert_eq!(status.capabilities["read"].status, "available");
         assert_eq!(status.capabilities["write"].status, "available");
         assert!(status.next_actions.contains(&"start_task".to_string()));
+    }
+
+    #[test]
+    fn paused_task_stays_current_but_is_not_writable() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+        let task = harness.start_task("pause semantics").expect("start");
+        harness
+            .transition(&task.id, TaskStatus::Paused)
+            .expect("pause task");
+
+        assert_eq!(harness.current_task().expect("current").expect("task").id, task.id);
+        let status = harness.status().expect("status");
+        assert_eq!(status.task_state, Some(TaskStatus::Paused));
+        assert_eq!(status.baseline_matches, Some(true));
+        assert!(!status.writable);
+        assert!(status.reason.contains("已暂停"));
+        assert!(status.next_actions.contains(&"resume_task".to_string()));
     }
 
     #[test]

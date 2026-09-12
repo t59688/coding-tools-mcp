@@ -1,6 +1,6 @@
-use std::path::Path;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 
 use serde_json::{json, Value};
 
@@ -63,14 +63,26 @@ fn record_execution_ledger(
     tracked_task_id: Option<&str>,
 ) {
     if !mutating_tool_call(name, args)
-        && !matches!(name, "start_task" | "update_task" | "pause_task" | "resume_task" | "finish_task")
+        && !matches!(
+            name,
+            "start_task" | "update_task" | "pause_task" | "resume_task" | "finish_task"
+        )
     {
         return;
     }
-    let succeeded = output.get("ok").and_then(Value::as_bool) != Some(false);
+    let transport_ok = output.get("ok").and_then(Value::as_bool) != Some(false);
+    let command_ok = output
+        .get("command_ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let succeeded = transport_ok && command_ok;
     let task_id = tracked_task_id
         .map(str::to_string)
-        .or_else(|| args.get("task_id").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            args.get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .or_else(|| {
             output
                 .get("task")
@@ -82,7 +94,12 @@ fn record_execution_ledger(
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            (!command_ok)
+                .then(|| output.get("stderr").and_then(Value::as_str).map(str::to_string))
+                .flatten()
+        });
     let changed_files = output
         .get("affected_files")
         .and_then(Value::as_array)
@@ -101,7 +118,12 @@ fn record_execution_ledger(
         || (name == "history_manage"
             && args.get("action").and_then(Value::as_str) == Some("checkpoint"));
     let history_checkpoint_ref = is_checkpoint
-        .then(|| output.get("path").and_then(Value::as_str).map(str::to_string))
+        .then(|| {
+            output
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .flatten();
     let verification = args
         .get("tests")
@@ -136,12 +158,8 @@ fn capability_health_check(ctx: &ToolContext) -> Value {
     let mut hasher = DefaultHasher::new();
     tools.hash(&mut hasher);
     json!({
-        "authentication": {
-            "status": "available"
-        },
-        "authorization": {
-            "mode": ctx.permission_mode
-        },
+        "authentication": { "status": "available" },
+        "authorization": { "mode": ctx.permission_mode },
         "workspace": {
             "path": ctx.workspace.root().display().to_string(),
             "status": "available"
@@ -158,6 +176,14 @@ fn capability_health_check(ctx: &ToolContext) -> Value {
 }
 
 fn mutating_tool_call(name: &str, args: &Value) -> bool {
+    if name == "apply_patch"
+        && args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
     manage::action_is_mutating(name, args)
         .unwrap_or_else(|| crate::tools::registry::MUTATING_TOOLS.contains(&name))
 }
@@ -190,18 +216,20 @@ fn plan_mode_blocks_tool(name: &str, args: &Value) -> bool {
 }
 
 fn load_planning_state(ctx: &ToolContext) -> Result<PlanningState, Value> {
-    PlanningService::new(ctx.workspace.root()).state().map_err(|error| {
-        tool_err(WorkspaceError::ToolDetails {
-            code: "PLANNING_STATE_UNAVAILABLE",
-            message: format!("Cannot read project planning state: {error}"),
-            category: "storage",
-            retryable: false,
-            details: json!({
-                "storage_path": PLANNING_RELATIVE_PATH,
-                "fail_closed_for_mutations": true
-            }),
+    PlanningService::new(ctx.workspace.root())
+        .state()
+        .map_err(|error| {
+            tool_err(WorkspaceError::ToolDetails {
+                code: "PLANNING_STATE_UNAVAILABLE",
+                message: format!("Cannot read project planning state: {error}"),
+                category: "storage",
+                retryable: false,
+                details: json!({
+                    "storage_path": PLANNING_RELATIVE_PATH,
+                    "fail_closed_for_mutations": true
+                }),
+            })
         })
-    })
 }
 
 fn planning_gate(state: &PlanningState, name: &str, args: &Value) -> Option<Value> {
@@ -210,17 +238,19 @@ fn planning_gate(state: &PlanningState, name: &str, args: &Value) -> Option<Valu
     }
     match state.mode {
         PlanningMode::Direct => None,
-        PlanningMode::Plan if plan_mode_blocks_tool(name, args) => Some(tool_err(WorkspaceError::ToolDetails {
-            code: "PLAN_MODE_READ_ONLY",
-            message: format!("{name} is disabled while this workspace is in Plan mode"),
-            category: "permission",
-            retryable: false,
-            details: json!({
-                "mode": "plan",
-                "revision": state.revision,
-                "suggestion": "Use read/planning tools, or switch the workspace to Goal/Direct mode from the desktop app."
-            }),
-        })),
+        PlanningMode::Plan if plan_mode_blocks_tool(name, args) => {
+            Some(tool_err(WorkspaceError::ToolDetails {
+                code: "PLAN_MODE_READ_ONLY",
+                message: format!("{name} is disabled while this workspace is in Plan mode"),
+                category: "permission",
+                retryable: false,
+                details: json!({
+                    "mode": "plan",
+                    "revision": state.revision,
+                    "suggestion": "Use read/planning tools, or switch the workspace to Goal/Direct mode from the desktop app."
+                }),
+            }))
+        }
         PlanningMode::Plan => None,
         PlanningMode::Goal => goal_mode_gate(state, name),
     }
@@ -301,13 +331,15 @@ fn planning_permission_error(
     })
 }
 
-/// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
-/// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
     let planning_state = match load_planning_state(ctx) {
         Ok(state) => Some(state),
-        Err(error) if planning_protected_tool(name, &effective_args) || name == "exec_health_check" => return error,
+        Err(error)
+            if planning_protected_tool(name, &effective_args) || name == "exec_health_check" =>
+        {
+            return error
+        }
         Err(_) => None,
     };
     if let Some(state) = planning_state.as_ref() {
@@ -340,9 +372,29 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
             .unwrap_or(output);
     }
 
+    let mut kill_absorb_task_id = None;
+    if name == "kill_session" {
+        if let Some(task) = ctx.harness.current_task().ok().flatten() {
+            if task.status.is_writable() && ctx.harness.check_baseline(&task.id).is_ok() {
+                kill_absorb_task_id = Some(task.id);
+            }
+        }
+    }
+
     let task_id = if requires_write_baseline(name, &effective_args) {
         let task = ctx.harness.current_task().ok().flatten();
         if let Some(task) = task {
+            if !task.status.is_writable() {
+                return attach_harness_status(
+                    ctx,
+                    tool_err_code(
+                        "TASK_NOT_WRITABLE",
+                        "当前任务状态不允许修改工作区或执行可写操作",
+                        "permission",
+                    ),
+                    false,
+                );
+            }
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
                 return attach_harness_status(
                     ctx,
@@ -433,9 +485,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                         "workspace": ctx.workspace.root_display(),
                         "requested": effective_args
                     },
-                    "warnings": [
-                        "dangerous permission mode is enabled; permission-gated operations are auto-granted"
-                    ]
+                    "warnings": ["dangerous permission mode is enabled; permission-gated operations are auto-granted"]
                 })))
             } else {
                 Ok(tool_ok(json!({
@@ -510,7 +560,9 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
             operation_input(args),
             json!({"ok": succeeded, "tool": name}),
         );
-        let _ = ctx.harness.refresh_expected_state(task_id);
+        if succeeded && name != "write_stdin" {
+            let _ = ctx.harness.refresh_expected_state(task_id);
+        }
     }
     if let Some(operation) = operation {
         let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
@@ -528,9 +580,9 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         );
     }
     record_execution_ledger(ctx, name, &effective_args, &output, task_id.as_deref());
-    if should_absorb_sidecar_writes(name) {
-        if let Some(task) = ctx.harness.current_task().ok().flatten() {
-            let _ = ctx.harness.refresh_expected_state(&task.id);
+    if name == "kill_session" && output.get("ok").and_then(Value::as_bool) == Some(true) {
+        if let Some(task_id) = kill_absorb_task_id.as_deref() {
+            let _ = ctx.harness.refresh_expected_state(task_id);
         }
     }
     if should_attach_planning_context(ctx, name, &output) {
@@ -601,7 +653,11 @@ fn attach_planning_context(mut output: Value, state: &PlanningState) -> Value {
         .as_deref()
         .and_then(|id| state.goals.iter().find(|goal| goal.id == id))
         .map(|goal| {
-            let completed = goal.success_criteria.iter().filter(|item| item.completed).count();
+            let completed = goal
+                .success_criteria
+                .iter()
+                .filter(|item| item.completed)
+                .count();
             json!({
                 "id": goal.id,
                 "title": goal.title,
@@ -660,7 +716,10 @@ fn apply_default_cwd(ctx: &ToolContext, name: &str, args: &Value) -> Value {
             effective["workdir"] = Value::String(base.clone());
         }
         "list_dir" | "list_files" | "git_status" | "git_log" => {
-            let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
+            let path = effective
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
         "read_file" | "search_text" | "grep_text" | "grep" | "git_blame" | "view_image" => {
@@ -720,26 +779,26 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
         .join("\n")
 }
 
+fn history_workspace_mutation(args: &Value) -> bool {
+    matches!(
+        args.get("action").and_then(Value::as_str),
+        Some("bootstrap" | "checkpoint" | "validate")
+    )
+}
+
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
-        "exec_command" => true,
+        "exec_command" | "write_stdin" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "history_manage" => history_workspace_mutation(args),
+        "history_session_bootstrap" | "history_session_checkpoint" | "history_session_validate" => {
+            true
+        }
         _ => false,
     }
-}
-
-fn should_absorb_sidecar_writes(name: &str) -> bool {
-    matches!(
-        name,
-        "history_session_bootstrap"
-            | "history_session_checkpoint"
-            | "history_session_validate"
-            | "history_manage"
-            | "kill_session"
-    )
 }
 
 fn standalone_operation(name: &str) -> bool {
@@ -830,9 +889,7 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
-    let history_context = crate::tools::history::context_snapshot(ctx)
-        .ok()
-        .flatten();
+    let history_context = crate::tools::history::context_snapshot(ctx).ok().flatten();
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
@@ -887,6 +944,31 @@ mod planning_tests {
         assert_eq!(blocked["error"]["code"], "PLAN_MODE_READ_ONLY");
         assert!(planning_gate(&state, "exec_command", &json!({})).is_some());
         assert!(planning_gate(&state, "kill_session", &json!({})).is_none());
+    }
+
+    #[test]
+    fn dry_run_patch_is_not_recorded_as_mutation() {
+        assert!(!mutating_tool_call(
+            "apply_patch",
+            &json!({"dry_run": true, "patch": ""})
+        ));
+        assert!(mutating_tool_call(
+            "apply_patch",
+            &json!({"dry_run": false, "patch": ""})
+        ));
+    }
+
+    #[test]
+    fn history_mutations_and_stdin_require_harness_baseline() {
+        assert!(requires_write_baseline(
+            "history_manage",
+            &json!({"action":"bootstrap"})
+        ));
+        assert!(!requires_write_baseline(
+            "history_manage",
+            &json!({"action":"read"})
+        ));
+        assert!(requires_write_baseline("write_stdin", &json!({})));
     }
 
     #[test]
@@ -1005,7 +1087,6 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "script_extensions": ctx.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
             "resolution": "workdir_first"
         },
-        // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "warnings": ["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]
     })))

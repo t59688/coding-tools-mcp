@@ -346,7 +346,10 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line_arg = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line_arg = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_u64)
@@ -470,9 +473,17 @@ struct GitOutput {
     stderr: String,
 }
 
-fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
+fn run_git(
+    cwd: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -556,25 +567,29 @@ fn parse_branch_line(line: &str) -> (String, String, i64, i64) {
     (branch, upstream, ahead, behind)
 }
 
+fn push_diff_file(files: &mut Vec<Value>, path: &str) {
+    if files
+        .iter()
+        .any(|file| file.get("path").and_then(Value::as_str) == Some(path))
+    {
+        return;
+    }
+    files.push(json!({
+        "path": path,
+        "status": "modified",
+        "binary": false
+    }));
+}
+
 fn parse_diff_files(diff: &str) -> Vec<Value> {
     let mut files = Vec::new();
     for line in diff.lines() {
         if let Some(path) = line.strip_prefix("+++ b/") {
-            files.push(json!({
-                "path": path,
-                "status": "modified",
-                "binary": false
-            }));
+            push_diff_file(&mut files, path);
         } else if line.starts_with("--- /dev/null") {
             continue;
         } else if let Some(path) = line.strip_prefix("--- a/") {
-            if !files.iter().any(|f| f["path"] == path) {
-                files.push(json!({
-                    "path": path,
-                    "status": "modified",
-                    "binary": false
-                }));
-            }
+            push_diff_file(&mut files, path);
         }
     }
     files
@@ -586,5 +601,26 @@ fn git_error(message: &str) -> WorkspaceError {
         message: message.to_string(),
         category: "runtime",
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_file_metadata_contains_each_modified_path_once() {
+        let diff = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let files = parse_diff_files(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "README.md");
+    }
+
+    #[test]
+    fn diff_file_metadata_deduplicates_paths_across_combined_chunks() {
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n";
+        let files = parse_diff_files(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "src/lib.rs");
     }
 }
