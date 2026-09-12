@@ -87,6 +87,36 @@ fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         None
     };
 
+    match recovery
+        .as_ref()
+        .and_then(|value| value.get("recoverable_via_baseline_acceptance"))
+        .and_then(Value::as_bool)
+    {
+        Some(true) => {
+            if !status
+                .next_actions
+                .iter()
+                .any(|action| action == "task_manage:resume")
+            {
+                let insert_at = status
+                    .next_actions
+                    .iter()
+                    .position(|action| action == "task_manage:refresh_baseline")
+                    .map(|index| index + 1)
+                    .unwrap_or(status.next_actions.len());
+                status
+                    .next_actions
+                    .insert(insert_at, "task_manage:resume".to_string());
+            }
+        }
+        Some(false) => {
+            status.next_actions.retain(|action| {
+                action != "task_manage:refresh_baseline" && action != "task_manage:resume"
+            });
+        }
+        None => {}
+    }
+
     let mut value = serde_json::to_value(status)
         .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))?;
     if let (Some(object), Some(recovery)) = (value.as_object_mut(), recovery) {
@@ -117,7 +147,6 @@ fn project_state(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     serde_json::to_value(ctx.harness.project_state(max_files).map_err(map_error)?)
         .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
 }
-
 fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let objective = args
         .get("objective")
