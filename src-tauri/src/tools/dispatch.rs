@@ -823,7 +823,7 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
             action
                 .split_once(':')
                 .filter(|(tool, _)| exposed.contains(tool))
-                .map(|_| action)
+                .map(|_| action.clone())
         })
         .collect()
 }
