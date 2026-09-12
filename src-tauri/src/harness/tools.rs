@@ -62,12 +62,15 @@ fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
             .map_err(map_error)?
             .map(|task| {
                 let current = capture_baseline(ctx.workspace.root());
-                if current.branch != task.baseline.branch || current.head != task.baseline.head {
+                if current.branch != task.baseline.branch {
                     json!({
                         "type": "git_revision_drift",
                         "recoverable_via_baseline_acceptance": false,
                         "preferred_action": "task_manage:project_state",
-                        "message": "Git branch/HEAD 已变化；必须先审查 revision，refresh_baseline/resume 兼容恢复不会接受该变化"
+                        "task_start_head": task.baseline.head,
+                        "current_head": current.head,
+                        "head_changed": current.head != task.baseline.head,
+                        "message": "Git 分支已变化；必须先回到任务原分支或结束当前任务，reviewed baseline recovery 不接受跨分支状态"
                     })
                 } else {
                     json!({
@@ -77,9 +80,12 @@ fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
                         "compatibility_action": "task_manage:resume",
                         "task_id": task.id,
                         "change_id": current.worktree_fingerprint,
+                        "task_start_head": task.baseline.head,
+                        "current_head": current.head,
+                        "head_changed": current.head != task.baseline.head,
                         "requires_review": true,
                         "requires_summary": true,
-                        "message": "先审查 project_state/git_diff。若客户端缓存的 task_manage schema 尚未包含 refresh_baseline，可调用 resume 并同时传 task_id、这里的 change_id 与非空 summary；服务端仅在 worktree 仍精确匹配该 fingerprint 时接受恢复。"
+                        "message": "先审查 project_state/git_diff。refresh_baseline 必须同时传 task_id、这里的 change_id 与非空 summary；缓存旧 task_manage schema 的客户端可用 resume 传同样字段。服务端仅在分支未变且 worktree 仍精确匹配该 fingerprint 时接受恢复。"
                     })
                 }
             })
@@ -180,11 +186,6 @@ fn transition(
     Ok(json!({"task": task}))
 }
 
-/// Resume normally when the baseline still matches. For stale clients whose cached
-/// `task_manage` schema predates the explicit `refresh_baseline` action, `resume`
-/// also provides a compatibility recovery path using fields that already existed in
-/// the v2 schema: `change_id` carries the reviewed worktree fingerprint and `summary`
-/// records why that exact state is being accepted.
 fn resume_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let requested_task_id = task_id(args)?;
     let Some(reviewed_fingerprint) = args.get("change_id").and_then(Value::as_str) else {
@@ -197,17 +198,7 @@ fn resume_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
             "兼容基线恢复的 change_id 必须是非空 worktree fingerprint",
         ));
     }
-    let review_summary = args
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            tool_error(
-                "BASELINE_REVIEW_REQUIRED",
-                "兼容基线恢复必须提供非空 summary，说明已审查当前 project_state/git_diff",
-            )
-        })?;
+    let review_summary = required_review_summary(args, "兼容基线恢复")?;
 
     let active_task = ctx
         .harness
@@ -286,10 +277,6 @@ fn resume_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     }))
 }
 
-/// Accept the currently reviewed worktree as the task's expected state without
-/// rewriting the immutable task-start baseline. Branch/HEAD changes are never
-/// blessed by this recovery action. When `change_id` is supplied it is treated as
-/// the exact reviewed worktree fingerprint and provides optimistic concurrency.
 fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let requested_task_id = task_id(args)?;
     let active_task = ctx
@@ -304,24 +291,24 @@ fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         ));
     }
 
-    let reviewed_fingerprint = match args.get("change_id").and_then(Value::as_str) {
-        Some(value) if value.trim().is_empty() => {
-            return Err(tool_error("INVALID_ARGUMENT", "change_id 不能为空"))
-        }
-        Some(value) => Some(value.trim()),
-        None => None,
-    };
-    let review_summary = args
-        .get("summary")
+    let reviewed_fingerprint = args
+        .get("change_id")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            tool_error(
+                "BASELINE_REVIEW_REQUIRED",
+                "refresh_baseline 必须提供 status.recovery.change_id 作为已审查 worktree 的精确 fingerprint",
+            )
+        })?;
+    let review_summary = required_review_summary(args, "refresh_baseline")?;
     let previous_expected_fingerprint = active_task.expected_fingerprint.clone();
     let (refreshed, current) = accept_reviewed_baseline(
         &ctx.harness,
         ctx.workspace.root(),
         requested_task_id,
-        reviewed_fingerprint,
+        Some(reviewed_fingerprint),
     )
     .map_err(map_error)?;
     let expected_fingerprint = refreshed.expected_fingerprint.clone();
@@ -357,8 +344,21 @@ fn refresh_baseline(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             "accepted_worktree_fingerprint": current.worktree_fingerprint,
             "event_id": event.id
         },
-        "warnings": ["原始 task.baseline 保持不变；Git branch/HEAD 漂移不会被该操作接受"]
+        "warnings": ["原始 task.baseline 保持不变；跨分支状态不会被接受，同分支 HEAD 漂移仅在精确 fingerprint 审查后接受"]
     }))
+}
+
+fn required_review_summary<'a>(args: &'a Value, action: &str) -> Result<&'a str, WorkspaceError> {
+    args.get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            tool_error(
+                "BASELINE_REVIEW_REQUIRED",
+                format!("{action} 必须提供非空 summary，说明已审查当前 project_state/git_diff"),
+            )
+        })
 }
 
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
