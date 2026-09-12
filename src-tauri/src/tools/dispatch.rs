@@ -62,6 +62,11 @@ fn record_execution_ledger(
     output: &Value,
     tracked_task_id: Option<&str>,
 ) {
+    // Command-session lifecycle owns its ledger so a later terminal result cannot be
+    // overwritten by a successful transport-level poll or kill request.
+    if matches!(name, "exec_command" | "write_stdin" | "kill_session") {
+        return;
+    }
     if !mutating_tool_call(name, args)
         && !matches!(
             name,
@@ -70,12 +75,7 @@ fn record_execution_ledger(
     {
         return;
     }
-    let transport_ok = output.get("ok").and_then(Value::as_bool) != Some(false);
-    let command_ok = output
-        .get("command_ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let succeeded = transport_ok && command_ok;
+    let outcome = operation_outcome(name, output);
     let task_id = tracked_task_id
         .map(str::to_string)
         .or_else(|| {
@@ -90,16 +90,18 @@ fn record_execution_ledger(
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-    let last_error = output
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            (!command_ok)
-                .then(|| output.get("stderr").and_then(Value::as_str).map(str::to_string))
-                .flatten()
-        });
+    let last_error = (outcome == "failed")
+        .then(|| {
+            output
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| output.get("stderr").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .flatten();
     let changed_files = output
         .get("affected_files")
         .and_then(Value::as_array)
@@ -145,12 +147,57 @@ fn record_execution_ledger(
     let _ = PlanningService::new(ctx.workspace.root()).record_execution(ExecutionLedgerUpdate {
         task_id,
         last_tool: Some(last_tool),
-        state: Some(if succeeded { "completed" } else { "failed" }.into()),
+        state: Some(outcome.to_string()),
         last_error,
         changed_files,
         history_checkpoint_ref,
         verification,
     });
+}
+
+fn operation_outcome(name: &str, output: &Value) -> &'static str {
+    if output.get("ok").and_then(Value::as_bool) == Some(false) {
+        return "failed";
+    }
+    if name == "exec_command" {
+        return match output.get("status").and_then(Value::as_str) {
+            Some("running") => "running",
+            _ if output.get("termination_reason").and_then(Value::as_str) == Some("killed") => {
+                "cancelled"
+            }
+            _ if output.get("command_ok").and_then(Value::as_bool) == Some(true) => "completed",
+            _ if output.get("command_ok").is_some() => "failed",
+            _ => "completed",
+        };
+    }
+    if name == "kill_session" {
+        return match output.get("status").and_then(Value::as_str) {
+            Some("terminating") => "running",
+            _ if output.get("ok").and_then(Value::as_bool) == Some(true) => "completed",
+            _ => "failed",
+        };
+    }
+    "completed"
+}
+
+fn attach_operation_outcome(name: &str, output: &mut Value) {
+    let outcome = operation_outcome(name, output);
+    if let Some(object) = output.as_object_mut() {
+        object.insert("operation_outcome".into(), Value::String(outcome.into()));
+    }
+}
+
+fn operation_result_summary(name: &str, output: &Value) -> Value {
+    json!({
+        "transport_ok": output.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        "command_ok": output.get("command_ok").cloned().unwrap_or(Value::Null),
+        "operation_outcome": operation_outcome(name, output),
+        "status": output.get("status"),
+        "termination_reason": output.get("termination_reason"),
+        "exit_code": output.get("exit_code"),
+        "session_id": output.get("session_id"),
+        "affected_files": output.get("affected_files")
+    })
 }
 
 fn capability_health_check(ctx: &ToolContext) -> Value {
@@ -361,24 +408,16 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     }
 
     if crate::harness::tools::TOOL_NAMES.contains(&name) {
-        let output = match crate::harness::tools::call(ctx, name, args) {
+        let mut output = match crate::harness::tools::call(ctx, name, args) {
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
+        attach_operation_outcome(name, &mut output);
         record_execution_ledger(ctx, name, args, &output, None);
         return planning_state
             .as_ref()
             .map(|state| attach_planning_context(output.clone(), state))
             .unwrap_or(output);
-    }
-
-    let mut kill_absorb_task_id = None;
-    if name == "kill_session" {
-        if let Some(task) = ctx.harness.current_task().ok().flatten() {
-            if task.status.is_writable() && ctx.harness.check_baseline(&task.id).is_ok() {
-                kill_absorb_task_id = Some(task.id);
-            }
-        }
     }
 
     let task_id = if requires_write_baseline(name, &effective_args) {
@@ -395,6 +434,26 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                     false,
                 );
             }
+            match session::reconcile_task_sessions(ctx, &task.id) {
+                Ok(true) => {
+                    return attach_harness_status(
+                        ctx,
+                        tool_err(WorkspaceError::ToolDetails {
+                            code: "TASK_EXECUTION_IN_PROGRESS",
+                            message: "当前 Task 仍有会修改工作区的命令在运行；为避免把并发写入错误归因，请先等待、read_output 或 kill_session。".into(),
+                            category: "runtime",
+                            retryable: true,
+                            details: json!({
+                                "task_id": task.id,
+                                "suggestion": "Use read_output/write_stdin for the active session, or kill_session before starting another workspace mutation."
+                            }),
+                        }),
+                        false,
+                    )
+                }
+                Ok(false) => {}
+                Err(error) => return attach_harness_status(ctx, tool_err(error), false),
+            }
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
                 return attach_harness_status(
                     ctx,
@@ -407,7 +466,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                 "operation_started",
                 Some(name),
                 operation_input(args),
-                json!({"ok": true, "tracking": "task"}),
+                json!({"transport_ok": true, "operation_outcome": "running", "tracking": "task"}),
             );
             Some(task.id)
         } else {
@@ -425,7 +484,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                 name,
                 "started",
                 json!({"arguments_present": !args.is_null()}),
-                json!({"ok": true}),
+                json!({"transport_ok": true, "operation_outcome": "running"}),
             )
             .ok()
     } else {
@@ -464,9 +523,9 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         "patch_check" => patch::patch_check(ctx, &effective_args),
         "apply_patch" => patch::apply_patch(ctx, &effective_args),
         "exec_command" => exec::exec_command(ctx, &effective_args),
-        "read_output" => session::read_output(&ctx.sessions, &effective_args),
-        "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
-        "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
+        "read_output" => session::read_output(ctx, &effective_args),
+        "write_stdin" => session::write_stdin(ctx, &effective_args),
+        "kill_session" => session::kill_session(ctx, &effective_args),
         "git_status" => git::git_status(ws, &effective_args),
         "git_diff" => git::git_diff(ws, &effective_args),
         "git_log" => git::git_log(ws, &effective_args),
@@ -530,61 +589,79 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         }
     };
     let mut output = match result {
-        Ok(v) => v,
-        Err(e) => tool_err(e),
+        Ok(value) => value,
+        Err(error) => tool_err(error),
     };
-    if task_id.is_none()
-        && standalone_operation(name)
-        && output.get("ok") == Some(&Value::Bool(true))
-    {
-        attach_standalone_metadata(
-            &mut output,
-            "当前操作已在 standalone 模式完成；如需继续，直接调用下一个开发工具。",
-        );
+    attach_operation_outcome(name, &mut output);
+
+    if task_id.is_none() && standalone_operation(name) {
+        let hint = match operation_outcome(name, &output) {
+            "completed" => "当前操作已在 standalone 模式完成；如需继续，直接调用下一个开发工具。",
+            "running" => "命令仍在运行；使用 read_output/write_stdin/kill_session 继续该 session。",
+            _ => "命令未成功；请检查 command_ok、exit_code、stderr 或结构化 error 后重试。",
+        };
+        attach_standalone_metadata(&mut output, hint);
     }
+
     if let Some(operation) = operation.as_ref() {
         if let Some(object) = output.as_object_mut() {
             object.insert("operation_id".into(), Value::String(operation.id.clone()));
         }
+        if name == "exec_command" {
+            if let Some(session_id) = output.get("session_id").and_then(Value::as_str) {
+                session::bind_operation_and_finalize(ctx, session_id, &operation.id);
+            }
+        }
     }
+
     if output.get("ok").and_then(Value::as_bool) == Some(false) {
         output = attach_harness_status(ctx, output, task_id.is_none());
         output = attach_recovery_guidance(output);
     }
+
+    let outcome = operation_outcome(name, &output);
     if let Some(task_id) = task_id.as_deref() {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_event(
-            task_id,
-            "operation_finished",
-            Some(name),
-            operation_input(args),
-            json!({"ok": succeeded, "tool": name}),
-        );
-        if succeeded && name != "write_stdin" {
-            let _ = ctx.harness.refresh_expected_state(task_id);
+        if name == "exec_command" {
+            if outcome == "running" {
+                let _ = ctx.harness.record_event(
+                    task_id,
+                    "operation_yielded",
+                    Some(name),
+                    operation_input(args),
+                    operation_result_summary(name, &output),
+                );
+            }
+            // Terminal command events and baseline absorption are finalized by the
+            // retained session lifecycle, including background exits.
+        } else {
+            let _ = ctx.harness.record_event(
+                task_id,
+                "operation_finished",
+                Some(name),
+                operation_input(args),
+                operation_result_summary(name, &output),
+            );
+            if outcome == "completed" {
+                let _ = ctx.harness.refresh_expected_state(task_id);
+            }
         }
     }
+
     if let Some(operation) = operation {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_operation(
-            Some(&operation.id),
-            task_id.as_deref(),
-            name,
-            if succeeded { "completed" } else { "failed" },
-            operation_input(args),
-            json!({
-                "ok": succeeded,
-                "tool": name,
-                "affected_files": output.get("affected_files")
-            }),
-        );
-    }
-    record_execution_ledger(ctx, name, &effective_args, &output, task_id.as_deref());
-    if name == "kill_session" && output.get("ok").and_then(Value::as_bool) == Some(true) {
-        if let Some(task_id) = kill_absorb_task_id.as_deref() {
-            let _ = ctx.harness.refresh_expected_state(task_id);
+        let exec_session_owned = name == "exec_command" && output.get("session_id").is_some();
+        if !exec_session_owned || outcome == "running" {
+            let _ = ctx.harness.record_operation(
+                Some(&operation.id),
+                task_id.as_deref(),
+                name,
+                outcome,
+                operation_input(args),
+                operation_result_summary(name, &output),
+            );
         }
     }
+
+    record_execution_ledger(ctx, name, &effective_args, &output, task_id.as_deref());
     if should_attach_planning_context(ctx, name, &output) {
         if let Ok(latest) = PlanningService::new(ctx.workspace.root()).state() {
             output = attach_planning_context(output, &latest);
@@ -788,7 +865,7 @@ fn history_workspace_mutation(args: &Value) -> bool {
 
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
     match name {
-        "exec_command" | "write_stdin" => true,
+        "exec_command" => true,
         "apply_patch" => !args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -959,7 +1036,7 @@ mod planning_tests {
     }
 
     #[test]
-    fn history_mutations_and_stdin_require_harness_baseline() {
+    fn history_mutations_require_harness_baseline_but_stdin_poll_does_not() {
         assert!(requires_write_baseline(
             "history_manage",
             &json!({"action":"bootstrap"})
@@ -968,7 +1045,39 @@ mod planning_tests {
             "history_manage",
             &json!({"action":"read"})
         ));
-        assert!(requires_write_baseline("write_stdin", &json!({})));
+        assert!(!requires_write_baseline("write_stdin", &json!({})));
+    }
+
+    #[test]
+    fn operation_outcome_does_not_confuse_transport_success_with_command_success() {
+        assert_eq!(
+            operation_outcome(
+                "exec_command",
+                &json!({"ok": true, "status": "exited", "command_ok": false, "exit_code": 101})
+            ),
+            "failed"
+        );
+        assert_eq!(
+            operation_outcome(
+                "exec_command",
+                &json!({"ok": true, "status": "running", "command_ok": null})
+            ),
+            "running"
+        );
+        assert_eq!(
+            operation_outcome(
+                "exec_command",
+                &json!({"ok": true, "status": "exited", "command_ok": true, "exit_code": 0})
+            ),
+            "completed"
+        );
+        assert_eq!(
+            operation_outcome(
+                "kill_session",
+                &json!({"ok": true, "status": "killed", "command_ok": false})
+            ),
+            "completed"
+        );
     }
 
     #[test]
@@ -1065,6 +1174,8 @@ mod planning_tests {
 }
 
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    let mut allowed_commands = ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>();
+    allowed_commands.sort();
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
         "permission_mode": ctx.permission_mode,
@@ -1074,21 +1185,31 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
             "available": false,
             "enforced": false,
             "default_scope": "workspace",
-            "host_scope_available": false
+            "host_scope_available": false,
+            "security_boundary": "policy_only",
+            "note": "The runtime validates command/workdir policy, but child processes are not confined by an OS filesystem sandbox and retain the host account's filesystem capabilities."
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
         "workspace_exec_available": true,
         "workspace_exec_sandbox_enforced": false,
         "workspace_exec_boundary": "policy_only",
-        "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
+        "command_policy": {
+            "allowed_stems": allowed_commands,
+            "workspace_local_entries": ctx.policy.workspace_local_entries,
+            "stem_matching": "strip .exe/.cmd/.bat then match allowed command stem; configured workspace-local entries are evaluated separately"
+        },
+        "system_command_allowlist": allowed_commands,
         "configured_executable_paths": ctx.executable_paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "workspace_local_entries": {
             "enabled": ctx.policy.workspace_local_entries,
             "script_extensions": ctx.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
             "resolution": "workdir_first"
         },
-        "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
-        "warnings": ["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]
+        "allowed_commands": allowed_commands,
+        "warnings": [
+            "Workspace 子进程允许执行，但没有操作系统级文件系统沙箱；workspace scope 是策略边界而不是容器边界",
+            "tty=true 只有在真实 PTY backend 可用时才会报告 pty_attached=true；不支持的平台会返回 PTY_UNAVAILABLE"
+        ]
     })))
 }
 
