@@ -10,8 +10,9 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::harness::model::{FileChangeRecord, ProjectBaseline, TaskStatus};
+use crate::harness::model::{FileChangeRecord, ProjectBaseline};
 use crate::harness::state::diff_baselines;
+use crate::harness::Harness;
 use crate::planning::{ExecutionLedgerUpdate, PlanningService};
 use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
@@ -100,9 +101,9 @@ impl SessionStore {
         let mut completed = sessions
             .iter()
             .filter_map(|(id, session)| {
-                session
-                    .completed_at()
-                    .map(|completed_at| (id.clone(), completed_at))
+                (session.baseline_absorbed.load(Ordering::Acquire))
+                    .then(|| session.completed_at().map(|completed_at| (id.clone(), completed_at)))
+                    .flatten()
             })
             .collect::<Vec<_>>();
         completed.sort_by_key(|(_, completed_at)| *completed_at);
@@ -145,17 +146,18 @@ pub fn kill_workspace_sessions(workspace_root: &Path) -> usize {
                 .session_ids()
                 .into_iter()
                 .filter(|session_id| {
-                    let Ok(session) = store.get(session_id) else {
+                    let Ok(session) = store.get(session_id.as_str()) else {
                         return false;
                     };
                     tauri::async_runtime::block_on(async {
                         if session.is_running().await {
-                            session.mark_termination_reason("killed");
-                            let _ = deliver_signal(&session, "KILL").await;
-                            let _ = wait_for_exit(&session, 1500).await;
+                            if deliver_signal(&session, "KILL").await.is_ok() {
+                                session.mark_termination_reason("killed");
+                                let _ = wait_for_exit(&session, 1500).await;
+                            }
                         }
                     });
-                    store.remove(session_id);
+                    store.remove(session_id.as_str());
                     true
                 })
                 .count()
@@ -188,7 +190,8 @@ pub struct ExecSession {
     affected_files: Mutex<Vec<FileChangeRecord>>,
     operation_id: Mutex<Option<String>>,
     operation_finalized: AtomicBool,
-    command: String,
+    event_finalized: AtomicBool,
+    planning_finalized: AtomicBool,
 }
 
 impl ExecSession {
@@ -200,7 +203,6 @@ impl ExecSession {
         stderr_merged: bool,
         tracked_task_id: Option<String>,
         baseline_before: Option<ProjectBaseline>,
-        command: String,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
@@ -230,7 +232,8 @@ impl ExecSession {
             affected_files: Mutex::new(Vec::new()),
             operation_id: Mutex::new(None),
             operation_finalized: AtomicBool::new(false),
-            command,
+            event_finalized: AtomicBool::new(false),
+            planning_finalized: AtomicBool::new(false),
         }
     }
 
@@ -294,9 +297,10 @@ impl ExecSession {
     }
 
     pub async fn kill_and_wait(&self) {
-        self.mark_termination_reason("killed");
-        let _ = deliver_signal(self, "KILL").await;
-        let _ = wait_for_exit(self, 1500).await;
+        if deliver_signal(self, "KILL").await.is_ok() {
+            self.mark_termination_reason("killed");
+            let _ = wait_for_exit(self, 1500).await;
+        }
     }
 
     pub async fn refresh_status(&self) {
@@ -350,8 +354,10 @@ impl ExecSession {
     }
 
     fn retention_expired(&self) -> bool {
-        self.completed_at()
-            .is_some_and(|completed| completed.elapsed() >= SESSION_RETAIN_FOR)
+        self.baseline_absorbed.load(Ordering::Acquire)
+            && self
+                .completed_at()
+                .is_some_and(|completed| completed.elapsed() >= SESSION_RETAIN_FOR)
     }
 
     pub fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize, usize) {
@@ -380,11 +386,7 @@ impl ExecSession {
             .lock()
             .expect("termination lock")
             .clone();
-        let status = if self.has_exited() {
-            "exited"
-        } else {
-            "running"
-        };
+        let status = if self.has_exited() { "exited" } else { "running" };
         let reason = termination_reason.as_deref().unwrap_or("running");
         let command_ok = match reason {
             "exited" => Some(exit_code.is_some_and(|code| code == 0)),
@@ -475,6 +477,164 @@ pub fn reconcile_task_sessions(ctx: &ToolContext, task_id: &str) -> Result<bool,
         }
     }
     Ok(running)
+}
+
+pub(crate) fn finalize_session(
+    ctx: &ToolContext,
+    session: &Arc<ExecSession>,
+) -> Result<(), WorkspaceError> {
+    finalize_session_parts(&ctx.harness, ctx.workspace.root(), session)
+}
+
+fn finalize_session_parts(
+    harness: &Harness,
+    workspace_root: &Path,
+    session: &Arc<ExecSession>,
+) -> Result<(), WorkspaceError> {
+    if !session.has_exited() {
+        return Ok(());
+    }
+
+    if !session.baseline_absorbed.load(Ordering::Acquire) {
+        if let (Some(task_id), Some(before)) = (session.tracked_task_id(), session.baseline_before.as_ref()) {
+            let after = harness.capture_current_baseline(Some(before));
+            let changes = diff_baselines(before, &after);
+            harness
+                .refresh_expected_state(task_id)
+                .map_err(|error| WorkspaceError::Tool {
+                    code: "BASELINE_REFRESH_FAILED",
+                    message: error.to_string(),
+                    category: "runtime",
+                    retryable: true,
+                })?;
+            *session.affected_files.lock().expect("affected files lock") = changes;
+        }
+        session.baseline_absorbed.store(true, Ordering::Release);
+    }
+
+    finalize_task_event(harness, session);
+    finalize_operation_record(harness, session);
+    finalize_planning_ledger(workspace_root, session);
+    Ok(())
+}
+
+fn finalize_task_event(harness: &Harness, session: &ExecSession) {
+    let Some(task_id) = session.tracked_task_id() else {
+        return;
+    };
+    if session
+        .event_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if harness
+        .record_event(
+            task_id,
+            "operation_finished",
+            Some("exec_command"),
+            json!({"session_id": session.session_id}),
+            session.snapshot(65_536),
+        )
+        .is_err()
+    {
+        session.event_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn finalize_operation_record(harness: &Harness, session: &ExecSession) {
+    let Some(operation_id) = session.operation_id.lock().expect("operation id lock").clone() else {
+        return;
+    };
+    if session
+        .operation_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let snapshot = session.snapshot(65_536);
+    let kind = terminal_operation_kind(&snapshot);
+    if harness
+        .record_operation(
+            Some(&operation_id),
+            session.tracked_task_id(),
+            "exec_command",
+            kind,
+            json!({"reason": "session_terminal"}),
+            snapshot,
+        )
+        .is_err()
+    {
+        session.operation_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn finalize_planning_ledger(workspace_root: &Path, session: &ExecSession) {
+    if session
+        .planning_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let snapshot = session.snapshot(65_536);
+    let state = match terminal_operation_kind(&snapshot) {
+        "completed" => "completed",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    };
+    let last_error = if state == "failed" {
+        snapshot
+            .get("stderr")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                snapshot
+                    .get("termination_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    };
+    let changed_files = session
+        .affected_files
+        .lock()
+        .expect("affected files lock")
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    if PlanningService::new(workspace_root)
+        .record_execution(ExecutionLedgerUpdate {
+            task_id: session.tracked_task_id().map(str::to_string),
+            last_tool: Some("exec_command".into()),
+            state: Some(state.into()),
+            last_error,
+            changed_files,
+            history_checkpoint_ref: None,
+            verification: Vec::new(),
+        })
+        .is_err()
+    {
+        session.planning_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn terminal_operation_kind(snapshot: &Value) -> &'static str {
+    match snapshot
+        .get("termination_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("running")
+    {
+        "exited" if snapshot.get("command_ok").and_then(Value::as_bool) == Some(true) => "completed",
+        "killed" => "cancelled",
+        "running" => "running",
+        _ => "failed",
+    }
 }
 
 pub fn read_output(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -655,12 +815,12 @@ pub fn kill_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     let mut warnings = Vec::<String>::new();
 
     if running {
-        session.mark_termination_reason("killed");
         let delivery = tauri::async_runtime::block_on(deliver_signal(&session, signal))?;
         signal_effective = delivery.effective;
         if let Some(warning) = delivery.warning {
             warnings.push(warning);
         }
+        session.mark_termination_reason("killed");
         let exited = tauri::async_runtime::block_on(wait_for_exit(&session, wait_ms));
         if !exited && signal != "KILL" {
             escalated = true;
@@ -724,117 +884,7 @@ fn ensure_session_task_writable(ctx: &ToolContext, session: &ExecSession) -> Res
     }
 }
 
-fn finalize_session(ctx: &ToolContext, session: &Arc<ExecSession>) -> Result<(), WorkspaceError> {
-    if !session.has_exited() {
-        return Ok(());
-    }
-
-    if !session.baseline_absorbed.load(Ordering::Acquire) {
-        if let (Some(task_id), Some(before)) = (session.tracked_task_id(), session.baseline_before.as_ref()) {
-            let after = ctx.harness.capture_current_baseline(Some(before));
-            let changes = diff_baselines(before, &after);
-            ctx.harness
-                .refresh_expected_state(task_id)
-                .map_err(|error| WorkspaceError::Tool {
-                    code: "BASELINE_REFRESH_FAILED",
-                    message: error.to_string(),
-                    category: "runtime",
-                    retryable: true,
-                })?;
-            *session.affected_files.lock().expect("affected files lock") = changes;
-        }
-        session.baseline_absorbed.store(true, Ordering::Release);
-    }
-
-    finalize_operation_record(ctx, session);
-    finalize_planning_ledger(ctx, session);
-    Ok(())
-}
-
-fn finalize_operation_record(ctx: &ToolContext, session: &ExecSession) {
-    let Some(operation_id) = session.operation_id.lock().expect("operation id lock").clone() else {
-        return;
-    };
-    if session
-        .operation_finalized
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    let snapshot = session.snapshot(65_536);
-    let kind = terminal_operation_kind(&snapshot);
-    if ctx
-        .harness
-        .record_operation(
-            Some(&operation_id),
-            session.tracked_task_id(),
-            "exec_command",
-            kind,
-            json!({"reason": "session_terminal"}),
-            snapshot,
-        )
-        .is_err()
-    {
-        session.operation_finalized.store(false, Ordering::Release);
-    }
-}
-
-fn finalize_planning_ledger(ctx: &ToolContext, session: &ExecSession) {
-    let snapshot = session.snapshot(65_536);
-    let state = match terminal_operation_kind(&snapshot) {
-        "completed" => "completed",
-        "cancelled" => "cancelled",
-        _ => "failed",
-    };
-    let last_error = if state == "failed" {
-        snapshot
-            .get("stderr")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                snapshot
-                    .get("termination_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-    } else {
-        None
-    };
-    let changed_files = session
-        .affected_files
-        .lock()
-        .expect("affected files lock")
-        .iter()
-        .map(|change| change.path.clone())
-        .collect();
-    let _ = PlanningService::new(ctx.workspace.root()).record_execution(ExecutionLedgerUpdate {
-        task_id: session.tracked_task_id().map(str::to_string),
-        last_tool: Some("exec_command".into()),
-        state: Some(state.into()),
-        last_error,
-        changed_files,
-        history_checkpoint_ref: None,
-        verification: Vec::new(),
-    });
-}
-
-fn terminal_operation_kind(snapshot: &Value) -> &'static str {
-    match snapshot
-        .get("termination_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("running")
-    {
-        "exited" if snapshot.get("command_ok").and_then(Value::as_bool) == Some(true) => "completed",
-        "killed" => "cancelled",
-        "running" => "running",
-        _ => "failed",
-    }
-}
-
-pub fn schedule_session_eviction(store: Arc<SessionStore>, session: Arc<ExecSession>) {
+fn schedule_session_eviction(store: Arc<SessionStore>, session: Arc<ExecSession>) {
     if session
         .retention_scheduled
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -849,24 +899,31 @@ pub fn schedule_session_eviction(store: Arc<SessionStore>, session: Arc<ExecSess
     });
 }
 
-pub fn spawn_session_monitor(ctx: Arc<ToolContext>, session: Arc<ExecSession>, deadline: Instant) {
+pub fn spawn_session_monitor(
+    store: Arc<SessionStore>,
+    harness: Harness,
+    workspace_root: PathBuf,
+    session: Arc<ExecSession>,
+    deadline: Instant,
+) {
     tauri::async_runtime::spawn(async move {
         loop {
             session.refresh_status().await;
             if session.has_exited() {
                 session.wait_for_readers().await;
-                let _ = finalize_session(ctx.as_ref(), &session);
-                schedule_session_eviction(ctx.sessions.clone(), session.clone());
+                let _ = finalize_session_parts(&harness, &workspace_root, &session);
+                schedule_session_eviction(store.clone(), session.clone());
                 return;
             }
             if Instant::now() >= deadline {
-                session.mark_termination_reason("timeout");
-                let _ = deliver_signal(&session, "KILL").await;
-                let _ = wait_for_exit(&session, 1500).await;
+                if deliver_signal(&session, "KILL").await.is_ok() {
+                    session.mark_termination_reason("timeout");
+                    let _ = wait_for_exit(&session, 1500).await;
+                }
                 session.refresh_status().await;
                 session.wait_for_readers().await;
-                let _ = finalize_session(ctx.as_ref(), &session);
-                schedule_session_eviction(ctx.sessions.clone(), session.clone());
+                let _ = finalize_session_parts(&harness, &workspace_root, &session);
+                schedule_session_eviction(store.clone(), session.clone());
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
