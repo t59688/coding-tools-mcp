@@ -54,14 +54,25 @@ fn reviewed_workspace_can_be_recovered_through_stable_task_manager() {
         .expect("next actions")
         .iter()
         .any(|action| action == "task_manage:refresh_baseline"));
+    assert_eq!(status["recovery"]["preferred_action"], "task_manage:refresh_baseline");
+    assert_eq!(status["recovery"]["compatibility_action"], "task_manage:resume");
+    let reviewed_fingerprint = status["recovery"]["change_id"]
+        .as_str()
+        .expect("reviewed worktree fingerprint")
+        .to_string();
 
     let refreshed = call_tool(
         &ctx,
         "task_manage",
-        &json!({"action": "refresh_baseline", "task_id": task_id}),
+        &json!({
+            "action": "refresh_baseline",
+            "task_id": task_id,
+            "change_id": reviewed_fingerprint,
+            "summary": "reviewed project_state and git_diff"
+        }),
     );
     assert_eq!(refreshed["ok"], true, "refresh: {refreshed}");
-    assert_eq!(refreshed["baseline_refreshed"], true);
+    assert_eq!(refreshed["diagnostics"]["baseline_refreshed"], true);
     assert_eq!(
         refreshed["task"]["baseline"]["worktree_fingerprint"],
         original_baseline,
@@ -69,9 +80,10 @@ fn reviewed_workspace_can_be_recovered_through_stable_task_manager() {
     );
     assert_eq!(
         refreshed["task"]["expected_fingerprint"],
-        refreshed["accepted_worktree_fingerprint"]
+        refreshed["diagnostics"]["accepted_worktree_fingerprint"]
     );
-    assert_eq!(refreshed["status"]["baseline_matches"], true);
+    assert_eq!(refreshed["harness"]["baseline_matches"], true);
+    assert!(refreshed.get("status").is_none(), "refresh output must match the declared common status:string schema");
 
     let next = call_tool(
         &ctx,
@@ -79,6 +91,157 @@ fn reviewed_workspace_can_be_recovered_through_stable_task_manager() {
         &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
     );
     assert_eq!(next["ok"], true, "recovered task should execute: {next}");
+}
+
+#[test]
+fn stale_task_manage_schema_can_recover_via_resume_compatibility_action() {
+    let (_temp, workspace, ctx) = fixture();
+    let ctx = ctx.with_tool_profile("compact");
+    let started = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "start", "objective": "stale schema recovery"}),
+    );
+    assert_eq!(started["ok"], true, "start: {started}");
+    let task_id = started["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let paused = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "pause", "task_id": task_id}),
+    );
+    assert_eq!(paused["ok"], true, "pause: {paused}");
+    fs::write(workspace.join("README.md"), "reviewed stale-schema change\n")
+        .expect("模拟已审查变化");
+
+    let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
+    assert_eq!(status["baseline_matches"], false, "status: {status}");
+    let change_id = status["recovery"]["change_id"]
+        .as_str()
+        .expect("compat recovery fingerprint")
+        .to_string();
+
+    // `resume`, `task_id`, `change_id`, and `summary` all existed in the old v2
+    // task_manage schema, so this call remains valid even when a client cached the
+    // pre-refresh_baseline enum.
+    let resumed = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({
+            "action": "resume",
+            "task_id": task_id,
+            "change_id": change_id,
+            "summary": "reviewed project_state and git_diff; accept this exact fingerprint"
+        }),
+    );
+    assert_eq!(resumed["ok"], true, "resume compatibility recovery: {resumed}");
+    assert_eq!(resumed["task"]["status"], "active");
+    assert_eq!(resumed["diagnostics"]["baseline_refreshed"], true);
+    assert_eq!(resumed["diagnostics"]["compatibility_mode"], true);
+    assert_eq!(resumed["harness"]["baseline_matches"], true);
+
+    let next = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({"cmd": "python --version", "filesystem_scope": "workspace"}),
+    );
+    assert_eq!(next["ok"], true, "compatibility recovery should unblock exec: {next}");
+}
+
+#[test]
+fn resume_compatibility_rejects_a_worktree_that_changed_after_review() {
+    let (_temp, workspace, ctx) = fixture();
+    let ctx = ctx.with_tool_profile("compact");
+    let started = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "start", "objective": "optimistic baseline recovery"}),
+    );
+    let task_id = started["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let original_expected = started["task"]["expected_fingerprint"]
+        .as_str()
+        .expect("expected fingerprint")
+        .to_string();
+    let paused = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "pause", "task_id": task_id}),
+    );
+    assert_eq!(paused["ok"], true, "pause: {paused}");
+
+    fs::write(workspace.join("README.md"), "reviewed once\n").expect("first external write");
+    let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
+    let reviewed_change_id = status["recovery"]["change_id"]
+        .as_str()
+        .expect("reviewed fingerprint")
+        .to_string();
+    fs::write(workspace.join("README.md"), "changed again after review\n")
+        .expect("second external write");
+
+    let rejected = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({
+            "action": "resume",
+            "task_id": task_id,
+            "change_id": reviewed_change_id,
+            "summary": "attempt to accept stale review"
+        }),
+    );
+    assert_eq!(rejected["ok"], false, "stale reviewed state must be rejected: {rejected}");
+    assert_eq!(rejected["error"]["code"], "FILE_CHANGED_EXTERNALLY");
+
+    let context = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "context", "task_id": task_id}),
+    );
+    assert_eq!(
+        context["task"]["expected_fingerprint"], original_expected,
+        "failed optimistic recovery must not mutate the expected fingerprint"
+    );
+    assert_eq!(context["task"]["status"], "paused");
+}
+
+#[test]
+fn resume_compatibility_requires_an_audit_summary() {
+    let (_temp, workspace, ctx) = fixture();
+    let ctx = ctx.with_tool_profile("compact");
+    let started = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "start", "objective": "audited recovery"}),
+    );
+    let task_id = started["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+    let paused = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "pause", "task_id": task_id}),
+    );
+    assert_eq!(paused["ok"], true, "pause: {paused}");
+    fs::write(workspace.join("README.md"), "reviewed\n").expect("external write");
+    let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
+    let change_id = status["recovery"]["change_id"]
+        .as_str()
+        .expect("reviewed fingerprint")
+        .to_string();
+
+    let rejected = call_tool(
+        &ctx,
+        "task_manage",
+        &json!({"action": "resume", "task_id": task_id, "change_id": change_id}),
+    );
+    assert_eq!(rejected["ok"], false, "summary is required: {rejected}");
+    assert_eq!(rejected["error"]["code"], "BASELINE_REVIEW_REQUIRED");
 }
 
 #[test]
@@ -108,6 +271,10 @@ fn refresh_baseline_refuses_to_bless_a_new_git_revision() {
     fs::write(workspace.join("README.md"), "new revision\n").expect("修改文件");
     git(&workspace, &["add", "README.md"]);
     git(&workspace, &["commit", "-m", "external revision"]);
+
+    let status = call_tool(&ctx, "task_manage", &json!({"action": "status"}));
+    assert_eq!(status["recovery"]["type"], "git_revision_drift");
+    assert_eq!(status["recovery"]["recoverable_via_baseline_acceptance"], false);
 
     let refreshed = call_tool(
         &ctx,
