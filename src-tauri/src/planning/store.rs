@@ -10,6 +10,7 @@ use crate::error::{AppError, AppResult};
 use super::{PlanningState, PLANNING_RELATIVE_PATH};
 
 const PRIVATE_PLANNING_RELATIVE_PATH: &str = "coding-tools/planning/state.json";
+const PRIVATE_PLANNING_DISPLAY_PATH: &str = "git-private:coding-tools/planning/state.json";
 
 #[derive(Debug, Clone)]
 pub struct PlanningStore {
@@ -39,6 +40,14 @@ impl PlanningStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn display_path(&self) -> &'static str {
+        if self.legacy_path.is_some() {
+            PRIVATE_PLANNING_DISPLAY_PATH
+        } else {
+            PLANNING_RELATIVE_PATH
+        }
     }
 
     pub fn load(&self) -> AppResult<PlanningState> {
@@ -241,6 +250,7 @@ mod tests {
 
         let store = PlanningStore::new(workspace.path());
         assert_ne!(store.path(), legacy.as_path());
+        assert_eq!(store.display_path(), PRIVATE_PLANNING_DISPLAY_PATH);
         assert!(store.path().to_string_lossy().contains(".git"));
         store
             .update(|state| {
