@@ -1,4 +1,5 @@
 pub mod model;
+pub mod recovery;
 pub mod state;
 pub mod store;
 pub mod tools;
