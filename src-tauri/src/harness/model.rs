@@ -54,12 +54,18 @@ impl TaskStatus {
             (self, next),
             (Self::Active, Self::Paused | Self::Verifying | Self::Failed)
                 | (Self::Active, Self::CompletedUnverified)
-                | (Self::Paused, Self::Active)
+                | (
+                    Self::Paused,
+                    Self::Active | Self::Verifying | Self::CompletedUnverified
+                )
                 | (
                     Self::Verifying,
                     Self::Completed | Self::CompletedUnverified | Self::Failed
                 )
-                | (Self::Failed, Self::Active | Self::RolledBack)
+                | (
+                    Self::Failed,
+                    Self::Active | Self::RolledBack | Self::CompletedUnverified
+                )
         )
     }
 }
