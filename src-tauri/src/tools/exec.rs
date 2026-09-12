@@ -8,10 +8,8 @@ use std::os::windows::process::CommandExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use std::sync::Arc;
-
 use crate::tools::context::ToolContext;
-use crate::tools::session::{ExecSession, SessionStore};
+use crate::tools::session::{self, ExecSession};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -36,24 +34,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .unwrap_or("workspace")
         .to_string();
     validate_child_process_scope(ctx, args)?;
-    if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
-        let mut result = result;
-        if let Some(object) = result.as_object_mut() {
-            object.insert(
-                "filesystem_scope".into(),
-                Value::String(filesystem_scope.clone()),
-            );
-            object.insert("sandbox_enforced".into(), Value::Bool(false));
-            object.insert(
-                "execution_boundary".into(),
-                Value::String("policy_only".into()),
-            );
-            object.insert("child_process".into(), Value::Bool(false));
-            object.insert("transport_ok".into(), Value::Bool(true));
-            object.insert("command_ok".into(), Value::Bool(true));
-        }
-        return Ok(tool_ok(result));
-    }
+
     let timeout_ms = args
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -69,6 +50,31 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .min(30_000);
     let tty = args.get("tty").and_then(Value::as_bool).unwrap_or(false);
     let stdin_text = args.get("stdin").and_then(Value::as_str).unwrap_or("");
+
+    if !tty {
+        if let Some(result) = run_native_diagnostic(ctx, cmd, &workdir.path)? {
+            let mut result = result;
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "filesystem_scope".into(),
+                    Value::String(filesystem_scope.clone()),
+                );
+                object.insert("sandbox_enforced".into(), Value::Bool(false));
+                object.insert(
+                    "execution_boundary".into(),
+                    Value::String("policy_only".into()),
+                );
+                object.insert("child_process".into(), Value::Bool(false));
+                object.insert("transport_ok".into(), Value::Bool(true));
+                object.insert("command_ok".into(), Value::Bool(true));
+                object.insert("interactive_requested".into(), Value::Bool(false));
+                object.insert("interactive".into(), Value::Bool(false));
+                object.insert("pty_attached".into(), Value::Bool(false));
+                object.insert("stderr_merged".into(), Value::Bool(false));
+            }
+            return Ok(tool_ok(result));
+        }
+    }
 
     let result = tauri::async_runtime::block_on(async {
         run_command(
@@ -147,11 +153,13 @@ fn run_native_diagnostic(
         "ls" | "dir" => Some(list_directory(ctx, cwd, &parts[1..])?),
         "which" if parts.len() == 2 => {
             let search_path = ctx.executable_path_env();
-            let path = which_on_path(&parts[1], cwd, search_path.as_deref()).ok_or_else(|| WorkspaceError::Tool {
-                code: "COMMAND_NOT_FOUND",
-                message: format!("Program not found on PATH: {}", parts[1]),
-                category: "runtime",
-                retryable: false,
+            let path = which_on_path(&parts[1], cwd, search_path.as_deref()).ok_or_else(|| {
+                WorkspaceError::Tool {
+                    code: "COMMAND_NOT_FOUND",
+                    message: format!("Program not found on PATH: {}", parts[1]),
+                    category: "runtime",
+                    retryable: false,
+                }
             })?;
             Some(format!("{}\n", path.display()))
         }
@@ -244,14 +252,19 @@ async fn run_command(
         search_path.as_deref(),
     )?;
     let start = Instant::now();
-    // A durable Harness task treats one non-interactive exec as one atomic tracked
-    // operation. Do not yield a still-running child and then freeze a partial
-    // fingerprint: the child may legitimately keep writing the workspace after
-    // the tool response (notably WSL installers/downloaders on a Windows host).
-    // Standalone and interactive sessions keep the existing retained-session UX.
-    let wait_for_task_completion = !tty && ctx.harness.current_task().ok().flatten().is_some();
+    let tracked_task = ctx
+        .harness
+        .current_task()
+        .map_err(harness_runtime_error)?;
+    let tracked_task_id = tracked_task.as_ref().map(|task| task.id.clone());
+    let baseline_before = tracked_task
+        .as_ref()
+        .map(|task| ctx.harness.expected_baseline(&task.id))
+        .transpose()
+        .map_err(harness_runtime_error)?;
 
-    let mut command = command_for_program(&program, &args);
+    let (mut command, pty_attached, stderr_merged) =
+        command_for_execution(&program, &args, tty)?;
     if let Some(path) = search_path.as_ref() {
         command.env("PATH", path);
     }
@@ -260,6 +273,7 @@ async fn run_command(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    configure_process_group(&mut command);
 
     #[cfg(windows)]
     command
@@ -267,9 +281,9 @@ async fn run_command(
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONLEGACYWINDOWSSTDIO", "0");
 
-    let child = command.spawn().map_err(|e| WorkspaceError::ToolDetails {
+    let child = command.spawn().map_err(|error| WorkspaceError::ToolDetails {
         code: "COMMAND_SPAWN_FAILED",
-        message: format!("Failed to start command: {e}"),
+        message: format!("Failed to start command: {error}"),
         category: "runtime",
         retryable: true,
         details: json!({
@@ -279,53 +293,93 @@ async fn run_command(
         }),
     })?;
 
-    let session = ctx.sessions.insert(ExecSession::new_with_mode(child, tty));
+    let session = ctx.sessions.insert(ExecSession::new_with_mode(
+        child,
+        tty,
+        pty_attached,
+        stderr_merged,
+        tracked_task_id,
+        baseline_before,
+    ));
     session.spawn_readers().await;
     let deadline = start + limit;
 
-    if yield_time.is_zero() && !wait_for_task_completion {
-        let snapshot = session.snapshot(max_output);
-        spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
-        return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
-    }
-
-    if !tty && !stdin_text.is_empty() {
+    if !stdin_text.is_empty() {
         let mut stdin_guard = session.stdin.lock().await;
         if let Some(stdin) = stdin_guard.as_mut() {
             use tokio::io::AsyncWriteExt;
-            if !stdin_text.is_empty() {
-                stdin
-                    .write_all(stdin_text.as_bytes())
-                    .await
-                    .map_err(|_| WorkspaceError::Tool {
-                        code: "SESSION_CLOSED",
-                        message: "Failed to write stdin.".into(),
-                        category: "runtime",
-                        retryable: false,
-                    })?;
+            stdin
+                .write_all(stdin_text.as_bytes())
+                .await
+                .map_err(|_| WorkspaceError::Tool {
+                    code: "SESSION_CLOSED",
+                    message: "Failed to write stdin.".into(),
+                    category: "runtime",
+                    retryable: false,
+                })?;
+            let _ = stdin.flush().await;
+            if !tty {
+                let _ = stdin.shutdown().await;
+                *stdin_guard = None;
+                session.mark_stdin_closed();
             }
+        }
+    } else if !tty {
+        let mut stdin_guard = session.stdin.lock().await;
+        if let Some(stdin) = stdin_guard.as_mut() {
+            use tokio::io::AsyncWriteExt;
             let _ = stdin.shutdown().await;
         }
         *stdin_guard = None;
         session.mark_stdin_closed();
     }
 
+    if yield_time.is_zero() {
+        session::spawn_session_monitor(
+            ctx.sessions.clone(),
+            ctx.harness.clone(),
+            ctx.workspace.root().to_path_buf(),
+            session.clone(),
+            deadline,
+        );
+        return Ok(merge_exec_result(
+            session.snapshot(max_output),
+            start,
+            cmd,
+            cwd,
+            true,
+        ));
+    }
+
     loop {
         session.refresh_status().await;
         if session.has_exited() {
             session.wait_for_readers().await;
+            session::finalize_session(ctx, &session)?;
             let snapshot = session.snapshot(max_output);
-            ctx.sessions.remove(&session.session_id);
+            session::spawn_session_monitor(
+                ctx.sessions.clone(),
+                ctx.harness.clone(),
+                ctx.workspace.root().to_path_buf(),
+                session.clone(),
+                Instant::now(),
+            );
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, false));
         }
-        if !tty && Instant::now() >= deadline {
-            session.mark_termination_reason("timeout");
+        if Instant::now() >= deadline {
             session.kill_and_wait().await;
+            session.mark_termination_reason("timeout");
             session.refresh_status().await;
             session.wait_for_readers().await;
+            session::finalize_session(ctx, &session)?;
             let snapshot = session.snapshot(max_output);
-            // Snapshot is embedded; schedule eviction so abandoned timeouts do not linger.
-            schedule_session_eviction(ctx.sessions.clone(), session.session_id.clone());
+            session::spawn_session_monitor(
+                ctx.sessions.clone(),
+                ctx.harness.clone(),
+                ctx.workspace.root().to_path_buf(),
+                session.clone(),
+                Instant::now(),
+            );
             return Err(WorkspaceError::ToolDetails {
                 code: "TIMEOUT",
                 message: "Command timed out.".into(),
@@ -339,43 +393,28 @@ async fn run_command(
                 }),
             });
         }
-        if !wait_for_task_completion && (Instant::now() - start >= yield_time || tty) {
+        if Instant::now().saturating_duration_since(start) >= yield_time {
+            session::spawn_session_monitor(
+                ctx.sessions.clone(),
+                ctx.harness.clone(),
+                ctx.workspace.root().to_path_buf(),
+                session.clone(),
+                deadline,
+            );
             let snapshot = session.snapshot(max_output);
-            spawn_timeout_monitor(ctx.sessions.clone(), session.clone(), deadline);
             return Ok(merge_exec_result(snapshot, start, cmd, cwd, true));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-/// How long a timed-out / background session stays readable before map eviction.
-const SESSION_EVICT_AFTER_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn spawn_timeout_monitor(
-    sessions: Arc<SessionStore>,
-    session: Arc<ExecSession>,
-    deadline: Instant,
-) {
-    tauri::async_runtime::spawn(async move {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        tokio::time::sleep(remaining).await;
-        session.refresh_status().await;
-        if !session.has_exited() {
-            session.mark_termination_reason("timeout");
-            session.kill_and_wait().await;
-            session.refresh_status().await;
-            session.wait_for_readers().await;
-        }
-        // Keep the session briefly so clients can still read_output / probe status.
-        schedule_session_eviction(sessions, session.session_id.clone());
-    });
-}
-
-fn schedule_session_eviction(sessions: Arc<SessionStore>, session_id: String) {
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(SESSION_EVICT_AFTER_TIMEOUT).await;
-        sessions.remove(&session_id);
-    });
+fn harness_runtime_error(error: crate::harness::HarnessError) -> WorkspaceError {
+    WorkspaceError::Tool {
+        code: "HARNESS_STATE_UNAVAILABLE",
+        message: error.to_string(),
+        category: "runtime",
+        retryable: true,
+    }
 }
 
 pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
@@ -447,7 +486,7 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
 }
 
 fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -> Option<Value> {
-    let code = match &error {
+    let code = match error {
         WorkspaceError::Tool { code, .. } | WorkspaceError::ToolDetails { code, .. } => *code,
     };
     if !matches!(
@@ -532,7 +571,7 @@ fn merge_exec_result(
             json!(if keep_session {
                 vec!["session retained for read_output/write_stdin/kill_session"]
             } else {
-                vec!["direct execution without shell"]
+                vec!["completed session retained temporarily for read_output"]
             }),
         );
     }
@@ -581,15 +620,14 @@ fn resolve_program(
             category: "runtime",
             retryable: false,
         })?;
-        let canonical_workspace =
-            workspace_root
-                .canonicalize()
-                .map_err(|_| WorkspaceError::Tool {
-                    code: "COMMAND_REJECTED",
-                    message: "Workspace root is unavailable".into(),
-                    category: "runtime",
-                    retryable: true,
-                })?;
+        let canonical_workspace = workspace_root
+            .canonicalize()
+            .map_err(|_| WorkspaceError::Tool {
+                code: "COMMAND_REJECTED",
+                message: "Workspace root is unavailable".into(),
+                category: "runtime",
+                retryable: true,
+            })?;
         if !resolved.starts_with(&canonical_workspace) {
             return Err(WorkspaceError::Tool {
                 code: "EXECUTABLE_OUTSIDE_WORKSPACE",
@@ -626,7 +664,7 @@ fn resolve_program(
     }
 
     which_on_path(trimmed, cwd, search_path)
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|path| path.to_string_lossy().into_owned())
         .ok_or_else(|| WorkspaceError::Tool {
             code: "COMMAND_REJECTED",
             message: format!("Program not found on PATH: {trimmed}"),
@@ -635,7 +673,7 @@ fn resolve_program(
         })
 }
 
-fn which_on_path(program: &str, cwd: &Path, search_path: Option<&OsStr>) -> Option<std::path::PathBuf> {
+fn which_on_path(program: &str, cwd: &Path, search_path: Option<&OsStr>) -> Option<PathBuf> {
     let Some(paths) = search_path else {
         return which::which(program).ok();
     };
@@ -697,6 +735,231 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(windows)]
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
+}
+
+fn command_for_execution(
+    program: &str,
+    args: &[String],
+    tty: bool,
+) -> Result<(Command, bool, bool), WorkspaceError> {
+    if !tty {
+        return Ok((command_for_program(program, args), false, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let script = which::which("script").map_err(|_| pty_unavailable(
+            "Linux TTY execution requires util-linux 'script' on PATH.",
+        ))?;
+        let mut command = Command::new(script);
+        command.args(["-q", "-f", "-e", "-c"]);
+        command.arg(posix_command_line(program, args));
+        command.arg("/dev/null");
+        return Ok((command, true, true));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = which::which("script").map_err(|_| pty_unavailable(
+            "macOS TTY execution requires /usr/bin/script.",
+        ))?;
+        let mut command = Command::new(script);
+        command.arg("-q").arg("/dev/null").arg(program).args(args);
+        return Ok((command, true, true));
+    }
+
+    #[cfg(windows)]
+    {
+        if is_wsl_program(program) {
+            let wrapped_args = wsl_tty_args(program, args)?;
+            return Ok((command_for_program(program, &wrapped_args), true, true));
+        }
+        return Err(pty_unavailable(
+            "Native Windows ConPTY is not provided by this runtime. tty=true is supported for WSL --exec/-e commands; use tty=false for native Windows commands.",
+        ));
+    }
+
+    #[allow(unreachable_code)]
+    Err(pty_unavailable("TTY execution is not supported on this platform."))
+}
+
+fn pty_unavailable(message: &str) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "PTY_UNAVAILABLE",
+        message: message.into(),
+        category: "runtime",
+        retryable: false,
+        details: json!({
+            "interactive_requested": true,
+            "pty_attached": false,
+            "suggestion": "Install the documented PTY backend or retry with tty=false; the runtime never reports a pipe as a TTY."
+        }),
+    }
+}
+
+fn posix_command_line(program: &str, args: &[String]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .map(posix_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn posix_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".into();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn is_wsl_program(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("wsl"))
+}
+
+#[cfg(windows)]
+fn wsl_tty_args(program: &str, args: &[String]) -> Result<Vec<String>, WorkspaceError> {
+    let exec_index = args
+        .iter()
+        .position(|arg| arg == "-e" || arg == "--exec")
+        .ok_or_else(|| pty_unavailable("WSL tty=true requires an explicit -e/--exec payload."))?;
+    let payload = args.get(exec_index + 1..).unwrap_or_default();
+    if payload.is_empty() {
+        return Err(pty_unavailable("WSL -e/--exec requires a command payload."));
+    }
+    let prefix = &args[..exec_index];
+    ensure_wsl_script_available(program, prefix)?;
+    let command_line = posix_command_line(&payload[0], &payload[1..]);
+    let mut wrapped = prefix.to_vec();
+    wrapped.extend([
+        "-e".into(),
+        "script".into(),
+        "-q".into(),
+        "-f".into(),
+        "-e".into(),
+        "-c".into(),
+        command_line,
+        "/dev/null".into(),
+    ]);
+    Ok(wrapped)
+}
+
+#[cfg(windows)]
+fn ensure_wsl_script_available(program: &str, prefix: &[String]) -> Result<(), WorkspaceError> {
+    let mut probe = std::process::Command::new(program);
+    probe.args(prefix).args([
+        "-e",
+        "sh",
+        "-lc",
+        "command -v script >/dev/null 2>&1",
+    ]);
+    probe.creation_flags(windows_hidden_creation_flags());
+    if probe.status().is_ok_and(|status| status.success()) {
+        Ok(())
+    } else {
+        Err(pty_unavailable(
+            "The selected WSL distribution does not provide util-linux 'script'. Install util-linux or retry with tty=false.",
+        ))
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+#[cfg(windows)]
+fn windows_hidden_creation_flags() -> u32 {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+}
+
+fn command_for_program(program: &str, args: &[String]) -> Command {
+    #[cfg(windows)]
+    {
+        let extension = Path::new(program)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("bat") | Some("cmd") => {
+                let mut command = Command::new("cmd.exe");
+                command.args(["/d", "/s", "/c"]);
+                command
+                    .as_std_mut()
+                    .raw_arg(windows_batch_command_line(program, args));
+                command.creation_flags(windows_hidden_creation_flags());
+                return command;
+            }
+            Some("ps1") => {
+                let shell = which::which("pwsh")
+                    .or_else(|_| which::which("powershell"))
+                    .unwrap_or_else(|_| PathBuf::from("powershell.exe"));
+                let mut command = Command::new(shell);
+                command
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        windows_command_path(program).as_str(),
+                    ])
+                    .args(args);
+                command.creation_flags(windows_hidden_creation_flags());
+                return command;
+            }
+            _ => {}
+        }
+    }
+
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(windows)]
+    command.creation_flags(windows_hidden_creation_flags());
+    command
+}
+
+#[cfg(windows)]
+fn windows_batch_command_line(program: &str, args: &[String]) -> String {
+    let mut command_line = String::from("call ");
+    command_line.push_str(&windows_batch_token(&windows_command_path(program)));
+    for arg in args {
+        command_line.push(' ');
+        command_line.push_str(&windows_batch_token(arg));
+    }
+    command_line
+}
+
+#[cfg(windows)]
+fn windows_batch_token(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn platform_command_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(windows_command_path(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(windows)]
+fn windows_command_path(path: &str) -> String {
+    path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
 
 #[cfg(test)]
@@ -783,10 +1046,13 @@ mod tests {
             None,
         )
         .expect("workspace entry resolves");
-        assert_eq!(
-            std::path::Path::new(&resolved),
-            entry.canonicalize().unwrap()
-        );
+        assert_eq!(Path::new(&resolved), entry.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn posix_quoting_preserves_single_quotes_and_spaces() {
+        assert_eq!(posix_quote("a b"), "'a b'");
+        assert_eq!(posix_quote("a'b"), "'a'\"'\"'b'");
     }
 
     #[cfg(windows)]
@@ -822,14 +1088,19 @@ mod tests {
         assert!(runner.contains("powershell") || runner.contains("pwsh"));
         assert!(script.as_std().get_args().any(|arg| arg == "-File"));
 
-        // Ensure console-subsystem programs (python.exe) also go through the
-        // hidden-window flag path; Command does not expose creation_flags for
-        // direct assertion, so this only verifies construction still succeeds.
         let python = command_for_program("C:/Python312/python.exe", &["-c".into(), "print(1)".into()]);
         assert_eq!(
             python.as_std().get_program().to_string_lossy(),
             "C:/Python312/python.exe"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_tty_is_rejected_instead_of_faked() {
+        let error = command_for_execution("C:/Python312/python.exe", &[], true)
+            .expect_err("native pipe must not be reported as PTY");
+        assert_eq!(error.code(), "PTY_UNAVAILABLE");
     }
 
     #[cfg(windows)]
@@ -852,9 +1123,8 @@ mod tests {
             "print('workflow-ok')\n",
         )
         .expect("python module");
-        let ctx =
-            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
-                .expect("context");
+        let ctx = ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+            .expect("context");
 
         for command in [
             "any-name.cmd",
@@ -912,10 +1182,7 @@ mod tests {
             );
             assert_eq!(output["command_ok"], true, "{script_name}: {output}");
             let stdout = output["stdout"].as_str().unwrap_or_default();
-            assert!(
-                stdout.contains("tooling-space-path-ok"),
-                "{script_name}: {output}"
-            );
+            assert!(stdout.contains("tooling-space-path-ok"), "{output}");
         }
     }
 
@@ -951,95 +1218,76 @@ mod tests {
         assert_eq!(output["command_ok"], true, "{output}");
         let stdout = output["stdout"].as_str().unwrap_or_default();
         assert!(stdout.contains("tooling-space-path-ok"), "{output}");
-        assert!(
-            stdout.contains("argument=[argument with spaces]"),
-            "{output}"
-        );
+        assert!(stdout.contains("argument=[argument with spaces]"), "{output}");
     }
-}
 
-#[cfg(windows)]
-fn windows_hidden_creation_flags() -> u32 {
-    // Match frpc/cloudflared: hide console-subsystem children (python/cmd/powershell)
-    // so remote exec_command does not flash a console or steal focus.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-}
-
-fn command_for_program(program: &str, args: &[String]) -> Command {
-    #[cfg(windows)]
-    {
-        let extension = Path::new(program)
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase);
-        match extension.as_deref() {
-            Some("bat") | Some("cmd") => {
-                let mut command = Command::new("cmd.exe");
-                command.args(["/d", "/s", "/c"]);
-                command
-                    .as_std_mut()
-                    .raw_arg(windows_batch_command_line(program, args));
-                command.creation_flags(windows_hidden_creation_flags());
-                return command;
-            }
-            Some("ps1") => {
-                let shell = which::which("pwsh")
-                    .or_else(|_| which::which("powershell"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from("powershell.exe"));
-                let mut command = Command::new(shell);
-                command
-                    .args([
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        windows_command_path(program).as_str(),
-                    ])
-                    .args(args);
-                command.creation_flags(windows_hidden_creation_flags());
-                return command;
-            }
-            _ => {}
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_tty_is_a_real_pty() {
+        if which::which("script").is_err() || which::which("python3").is_err() {
+            return;
         }
+        let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
+        let ctx = ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+            .expect("context");
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": "python3 -c \"import sys; print(sys.stdin.isatty(), sys.stdout.isatty(), sys.stderr.isatty())\"",
+                "tty": true,
+                "yield_time_ms": 5000,
+                "timeout_ms": 10000
+            }),
+        );
+        assert_eq!(output["command_ok"], true, "{output}");
+        assert_eq!(output["pty_attached"], true, "{output}");
+        let stdout = output["stdout"].as_str().unwrap_or_default();
+        assert!(stdout.contains("True True True"), "{output}");
     }
 
-    let mut command = Command::new(program);
-    command.args(args);
-    #[cfg(windows)]
-    command.creation_flags(windows_hidden_creation_flags());
-    command
-}
-
-#[cfg(windows)]
-fn windows_batch_command_line(program: &str, args: &[String]) -> String {
-    let mut command_line = String::from("call ");
-    command_line.push_str(&windows_batch_token(&windows_command_path(program)));
-    for arg in args {
-        command_line.push(' ');
-        command_line.push_str(&windows_batch_token(arg));
+    #[cfg(unix)]
+    #[test]
+    fn active_task_long_command_yields_and_completed_output_remains_readable() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let ctx = ToolContext::for_test(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("context");
+        ctx.harness.start_task("long command").expect("task");
+        let started = Instant::now();
+        let output = call_tool(
+            &ctx,
+            "exec_command",
+            &json!({
+                "cmd": "python3 -c \"import time; print('start', flush=True); time.sleep(0.4); print('done')\"",
+                "yield_time_ms": 30,
+                "timeout_ms": 5000
+            }),
+        );
+        assert_eq!(output["status"], "running", "{output}");
+        assert!(started.elapsed() < Duration::from_millis(1000), "{output}");
+        let session_id = output["session_id"].as_str().expect("session id");
+        std::thread::sleep(Duration::from_millis(600));
+        let polled = call_tool(
+            &ctx,
+            "write_stdin",
+            &json!({"session_id": session_id, "yield_time_ms": 0}),
+        );
+        assert_eq!(polled["command_ok"], true, "{polled}");
+        let output_ref = output["output_refs"]["stdout"].as_str().expect("output ref");
+        let retained = call_tool(
+            &ctx,
+            "read_output",
+            &json!({"output_ref": output_ref, "offset": 0, "limit": 4096}),
+        );
+        assert_eq!(retained["ok"], true, "{retained}");
+        assert!(retained["content"].as_str().unwrap_or_default().contains("done"));
     }
-    command_line
-}
-
-#[cfg(windows)]
-fn windows_batch_token(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn platform_command_path(path: &Path) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        std::path::PathBuf::from(windows_command_path(&path.to_string_lossy()))
-    }
-    #[cfg(not(windows))]
-    path.to_path_buf()
-}
-
-#[cfg(windows)]
-fn windows_command_path(path: &str) -> String {
-    path.strip_prefix("\\\\?\\").unwrap_or(path).to_string()
 }
