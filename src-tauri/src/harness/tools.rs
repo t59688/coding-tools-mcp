@@ -147,6 +147,7 @@ fn project_state(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     serde_json::to_value(ctx.harness.project_state(max_files).map_err(map_error)?)
         .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
 }
+
 fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let objective = args
         .get("objective")
