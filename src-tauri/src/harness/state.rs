@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -48,6 +48,10 @@ impl Harness {
         &self.workspace_id
     }
 
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub fn store_root(&self) -> &Path {
         self.store.root()
     }
@@ -62,7 +66,7 @@ impl Harness {
                 format!("工作区已有活动任务 {}", task.id),
             ));
         }
-        let baseline = capture_baseline(&self.workspace_root);
+        let baseline = capture_baseline_incremental(&self.workspace_root, None);
         let now = timestamp();
         let task = TaskSession {
             id: Uuid::new_v4().simple().to_string(),
@@ -70,6 +74,7 @@ impl Harness {
             objective: objective.trim().to_string(),
             status: TaskStatus::Active,
             expected_fingerprint: baseline.worktree_fingerprint.clone(),
+            expected_baseline: Some(baseline.clone()),
             baseline,
             completed_steps: Vec::new(),
             pending_steps: Vec::new(),
@@ -156,7 +161,8 @@ impl Harness {
 
     pub fn check_baseline(&self, task_id: &str) -> HarnessResult<()> {
         let task = self.task(task_id)?;
-        let current = capture_baseline(&self.workspace_root);
+        let expected = task.expected_baseline.as_ref().unwrap_or(&task.baseline);
+        let current = capture_baseline_incremental(&self.workspace_root, Some(expected));
         if current.branch != task.baseline.branch {
             return Err(HarnessError::new("BASELINE_STALE", "Git 分支已发生变化"));
         }
@@ -169,9 +175,21 @@ impl Harness {
         Ok(())
     }
 
+    pub fn expected_baseline(&self, task_id: &str) -> HarnessResult<ProjectBaseline> {
+        let task = self.task(task_id)?;
+        Ok(task.expected_baseline.unwrap_or(task.baseline))
+    }
+
+    pub fn capture_current_baseline(&self, previous: Option<&ProjectBaseline>) -> ProjectBaseline {
+        capture_baseline_incremental(&self.workspace_root, previous)
+    }
+
     pub fn refresh_expected_state(&self, task_id: &str) -> HarnessResult<TaskSession> {
         let mut task = self.task(task_id)?;
-        task.expected_fingerprint = capture_baseline(&self.workspace_root).worktree_fingerprint;
+        let previous = task.expected_baseline.as_ref().unwrap_or(&task.baseline);
+        let current = capture_baseline_incremental(&self.workspace_root, Some(previous));
+        task.expected_fingerprint = current.worktree_fingerprint.clone();
+        task.expected_baseline = Some(current);
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
         Ok(task)
@@ -185,6 +203,7 @@ impl Harness {
         input_summary: serde_json::Value,
         result_summary: serde_json::Value,
     ) -> HarnessResult<HarnessEvent> {
+        let affected_files = affected_files_from_value(&result_summary);
         let event = HarnessEvent {
             id: Uuid::new_v4().simple().to_string(),
             task_id: task_id.to_string(),
@@ -194,7 +213,7 @@ impl Harness {
             input_summary: json!({"workspace_id": self.workspace_id, "payload": input_summary}),
             result_summary,
             reason: None,
-            affected_files: Vec::<FileChangeRecord>::new(),
+            affected_files,
             created_at: timestamp(),
         };
         self.store
@@ -226,6 +245,7 @@ impl Harness {
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let affected_files = affected_files_from_value(&result_summary);
         let operation = OperationRecord {
             id: operation_id
                 .map(str::to_string)
@@ -237,7 +257,7 @@ impl Harness {
             input_summary,
             result_summary,
             reason,
-            affected_files: Vec::new(),
+            affected_files,
             created_at: timestamp(),
         };
         self.store.append_operation(&self.workspace_id, &operation)?;
@@ -254,8 +274,12 @@ impl Harness {
     }
 
     pub fn project_state(&self, max_files: usize) -> HarnessResult<ProjectState> {
-        let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let previous = task
+            .as_ref()
+            .and_then(|task| task.expected_baseline.as_ref())
+            .or_else(|| task.as_ref().map(|task| &task.baseline));
+        let current = capture_baseline_incremental(&self.workspace_root, previous);
         let baseline_map = task
             .as_ref()
             .map(|t| {
@@ -323,8 +347,12 @@ impl Harness {
     }
 
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
-        let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let previous = task
+            .as_ref()
+            .and_then(|task| task.expected_baseline.as_ref())
+            .or_else(|| task.as_ref().map(|task| &task.baseline));
+        let current = capture_baseline_incremental(&self.workspace_root, previous);
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
@@ -497,14 +525,48 @@ impl Harness {
 }
 
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
+    capture_baseline_incremental(root, None)
+}
+
+pub fn capture_baseline_incremental(
+    root: &Path,
+    previous: Option<&ProjectBaseline>,
+) -> ProjectBaseline {
+    let previous_map = previous
+        .map(|baseline| {
+            baseline
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut entries = Vec::new();
     for path in baseline_files(root) {
-        let Ok(bytes) = fs::read(&path) else { continue };
         let rel = path
             .strip_prefix(root)
             .unwrap_or(path.as_path())
             .to_string_lossy()
             .replace('\\', "/");
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        let bytes_len = metadata.len();
+        let modified_ns = modified_ns(&metadata);
+        if let Some(previous_entry) = previous_map.get(rel.as_str()) {
+            if previous_entry.bytes == bytes_len
+                && previous_entry.modified_ns.is_some()
+                && previous_entry.modified_ns == modified_ns
+            {
+                let mut reused = (*previous_entry).clone();
+                reused.modified_ns = modified_ns;
+                entries.push(reused);
+                continue;
+            }
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         entries.push(BaselineEntry {
@@ -513,6 +575,7 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
             is_binary: bytes.contains(&0),
             sha256: format!("{:x}", hasher.finalize()),
             bytes: bytes.len() as u64,
+            modified_ns,
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -529,6 +592,90 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
         entries,
         captured_at: timestamp(),
     }
+}
+
+pub fn diff_baselines(before: &ProjectBaseline, after: &ProjectBaseline) -> Vec<FileChangeRecord> {
+    let before_map = before
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let after_map = after
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut paths = before_map
+        .keys()
+        .chain(after_map.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| match (before_map.get(path), after_map.get(path)) {
+            (Some(before), Some(after)) if before.sha256 == after.sha256 => None,
+            (Some(before), Some(after)) => Some(FileChangeRecord {
+                path: path.to_string(),
+                status: "modified".into(),
+                before_sha256: Some(before.sha256.clone()),
+                after_sha256: Some(after.sha256.clone()),
+            }),
+            (Some(before), None) => Some(FileChangeRecord {
+                path: path.to_string(),
+                status: "deleted".into(),
+                before_sha256: Some(before.sha256.clone()),
+                after_sha256: None,
+            }),
+            (None, Some(after)) => Some(FileChangeRecord {
+                path: path.to_string(),
+                status: "added".into(),
+                before_sha256: None,
+                after_sha256: Some(after.sha256.clone()),
+            }),
+            (None, None) => None,
+        })
+        .collect()
+}
+
+fn affected_files_from_value(value: &Value) -> Vec<FileChangeRecord> {
+    value
+        .get("affected_files")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let path = item.get("path").and_then(Value::as_str)?.to_string();
+                    let status = item
+                        .get("status")
+                        .or_else(|| item.get("operation"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("modified")
+                        .to_string();
+                    Some(FileChangeRecord {
+                        path,
+                        status,
+                        before_sha256: item
+                            .get("before_sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        after_sha256: item
+                            .get("after_sha256")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn modified_ns(metadata: &fs::Metadata) -> Option<u64> {
+    let modified = metadata.modified().ok()?;
+    let nanos = modified.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    Some(nanos.min(u64::MAX as u128) as u64)
 }
 
 fn baseline_files(root: &Path) -> Vec<PathBuf> {
@@ -858,5 +1005,24 @@ mod tests {
         let status = harness.status().expect("status");
         assert!(status.writable);
         assert_eq!(status.baseline_matches, Some(true));
+    }
+
+    #[test]
+    fn incremental_baseline_reuses_unchanged_hash_and_detects_real_change() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("file");
+        let first = capture_baseline_incremental(workspace.path(), None);
+        let second = capture_baseline_incremental(workspace.path(), Some(&first));
+        assert_eq!(first.worktree_fingerprint, second.worktree_fingerprint);
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(workspace.path().join("main.rs"), "fn main() { println!(\"changed\"); }\n")
+            .expect("change");
+        let third = capture_baseline_incremental(workspace.path(), Some(&second));
+        assert_ne!(second.worktree_fingerprint, third.worktree_fingerprint);
+        let changes = diff_baselines(&second, &third);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "main.rs");
+        assert_eq!(changes[0].status, "modified");
     }
 }

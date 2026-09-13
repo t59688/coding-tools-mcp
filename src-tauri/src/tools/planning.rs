@@ -1,17 +1,16 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::planning::{
-    GoalStatus, PlanStatus, PlanStepStatus, PlanningService, PLANNING_RELATIVE_PATH,
-};
+use crate::planning::{GoalStatus, PlanStatus, PlanStepStatus, PlanningService};
 
 use super::context::ToolContext;
 use super::workspace::{tool_ok, WorkspaceError, WorkspaceResult};
 
 pub fn planning_state(ctx: &ToolContext, _args: &Value) -> WorkspaceResult<Value> {
-    let state = service(ctx).state().map_err(storage_error)?;
+    let planning = service(ctx);
+    let state = planning.state().map_err(storage_error)?;
     Ok(tool_ok(json!({
-        "storage_path": PLANNING_RELATIVE_PATH,
+        "storage_path": planning.storage_path(),
         "state": state
     })))
 }
@@ -34,7 +33,7 @@ pub fn create_goal(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     Ok(tool_ok(json!({
         "goal": goal,
         "focused": true,
-        "storage_path": PLANNING_RELATIVE_PATH
+        "storage_path": planning.storage_path()
     })))
 }
 
@@ -49,7 +48,8 @@ pub fn update_goal(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "AI cannot complete/archive a Goal directly. Use request_goal_review when work is ready for human acceptance.",
         ));
     }
-    let goal = service(ctx)
+    let planning = service(ctx);
+    let goal = planning
         .update_goal(
             goal_id,
             optional_string(args, "title"),
@@ -60,7 +60,7 @@ pub fn update_goal(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             args.get("focus").and_then(Value::as_bool),
         )
         .map_err(storage_error)?;
-    Ok(tool_ok(json!({"goal": goal, "storage_path": PLANNING_RELATIVE_PATH})))
+    Ok(tool_ok(json!({"goal": goal, "storage_path": planning.storage_path()})))
 }
 
 pub fn create_plan(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
@@ -81,7 +81,7 @@ pub fn create_plan(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     Ok(tool_ok(json!({
         "plan": plan,
         "focused": true,
-        "storage_path": PLANNING_RELATIVE_PATH
+        "storage_path": planning.storage_path()
     })))
 }
 
@@ -105,7 +105,8 @@ pub fn update_plan(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .into_iter()
         .map(|update| (update.step_id, update.status, update.notes))
         .collect();
-    let plan = service(ctx)
+    let planning = service(ctx);
+    let plan = planning
         .update_plan(
             plan_id,
             status,
@@ -113,11 +114,12 @@ pub fn update_plan(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             args.get("focus").and_then(Value::as_bool),
         )
         .map_err(storage_error)?;
-    Ok(tool_ok(json!({"plan": plan, "storage_path": PLANNING_RELATIVE_PATH})))
+    Ok(tool_ok(json!({"plan": plan, "storage_path": planning.storage_path()})))
 }
 
 pub fn request_goal_review(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
-    let goal = service(ctx)
+    let planning = service(ctx);
+    let goal = planning
         .request_goal_review(
             required_string(args, "goal_id")?,
             required_string(args, "summary")?,
@@ -126,12 +128,13 @@ pub fn request_goal_review(ctx: &ToolContext, args: &Value) -> WorkspaceResult<V
     Ok(tool_ok(json!({
         "goal": goal,
         "awaiting_human_acceptance": true,
-        "storage_path": PLANNING_RELATIVE_PATH
+        "storage_path": planning.storage_path()
     })))
 }
 
 pub fn request_plan_review(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
-    let plan = service(ctx)
+    let planning = service(ctx);
+    let plan = planning
         .request_plan_review(
             required_string(args, "plan_id")?,
             required_string(args, "summary")?,
@@ -140,7 +143,7 @@ pub fn request_plan_review(ctx: &ToolContext, args: &Value) -> WorkspaceResult<V
     Ok(tool_ok(json!({
         "plan": plan,
         "awaiting_human_acceptance": true,
-        "storage_path": PLANNING_RELATIVE_PATH
+        "storage_path": planning.storage_path()
     })))
 }
 
@@ -246,6 +249,10 @@ mod tests {
         let state = planning_state(&ctx, &json!({})).expect("state");
         assert_eq!(state["state"]["goals"].as_array().unwrap().len(), 1);
         assert_eq!(state["state"]["plans"].as_array().unwrap().len(), 1);
-        assert!(workspace.path().join(PLANNING_RELATIVE_PATH).exists());
+        assert_eq!(state["storage_path"], crate::planning::PLANNING_RELATIVE_PATH);
+        assert!(workspace
+            .path()
+            .join(crate::planning::PLANNING_RELATIVE_PATH)
+            .exists());
     }
 }

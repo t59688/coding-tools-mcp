@@ -51,6 +51,7 @@ const DEFAULT_ALLOWED_COMMANDS: &[&str] = &[
     "cmd",
     "powershell",
     "pwsh",
+    "wsl",
 ];
 
 #[derive(Debug, Clone)]
@@ -121,7 +122,6 @@ pub fn parse_allowed_commands(configured: &str) -> HashSet<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    // 基础诊断命令是工作区可用性的最低保障，不应因 Actions 配置遗漏而失效。
     commands.extend(BASIC_READ_ONLY_COMMANDS.iter().map(|s| s.to_string()));
     commands
 }
@@ -187,7 +187,6 @@ pub fn validate_tool_arguments_for_workspace(
     }
 }
 
-/// Actions OpenAPI 暴露层校验：仅限制「能否调用」，不参与执行逻辑。
 pub fn validate_actions_exposure(tool_name: &str) -> Result<(), PolicyError> {
     if is_allowed_tool(tool_name) {
         Ok(())
@@ -501,6 +500,7 @@ mod tests {
         let policy = PolicySettings::from_actions_config(&actions);
         assert!(policy.allowed_commands.contains("cargo"));
         assert!(policy.allowed_commands.contains("pytest"));
+        assert!(policy.allowed_commands.contains("wsl"));
     }
 
     #[test]
@@ -551,6 +551,12 @@ mod tests {
             validate_command(&json!({"cmd": command}), &policy)
                 .unwrap_or_else(|err| panic!("{command} should be allowed: {err}"));
         }
+    }
+
+    #[test]
+    fn wsl_is_an_explicit_default_allowed_command() {
+        let policy = PolicySettings::default();
+        assert!(validate_command(&json!({"cmd": "wsl.exe -e bash -lc pwd"}), &policy).is_ok());
     }
 
     #[test]

@@ -2,17 +2,24 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use crate::harness::model::{FileChangeRecord, ProjectBaseline};
+use crate::harness::state::diff_baselines;
+use crate::harness::Harness;
+use crate::planning::{ExecutionLedgerUpdate, PlanningService};
+use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
-use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
+const SESSION_RETAIN_FOR: Duration = Duration::from_secs(120);
+const MAX_RETAINED_SESSIONS: usize = 128;
 
 static WORKSPACE_SESSION_STORES: OnceLock<Mutex<HashMap<PathBuf, Vec<Weak<SessionStore>>>>> =
     OnceLock::new();
@@ -28,15 +35,18 @@ impl SessionStore {
     }
 
     pub fn insert(&self, session: ExecSession) -> Arc<ExecSession> {
+        self.prune();
         let arc = Arc::new(session);
         self.sessions
             .lock()
             .expect("sessions lock")
             .insert(arc.session_id.clone(), arc.clone());
+        self.prune_to_capacity();
         arc
     }
 
     pub fn get(&self, session_id: &str) -> Result<Arc<ExecSession>, WorkspaceError> {
+        self.prune();
         self.sessions
             .lock()
             .expect("sessions lock")
@@ -44,7 +54,7 @@ impl SessionStore {
             .cloned()
             .ok_or_else(|| WorkspaceError::Tool {
                 code: "SESSION_NOT_FOUND",
-                message: format!("Session not found: {session_id}"),
+                message: format!("Session not found or retention expired: {session_id}"),
                 category: "not_found",
                 retryable: false,
             })
@@ -57,13 +67,50 @@ impl SessionStore {
             .remove(session_id);
     }
 
+    pub fn task_sessions(&self, task_id: &str) -> Vec<Arc<ExecSession>> {
+        self.prune();
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .values()
+            .filter(|session| session.tracked_task_id.as_deref() == Some(task_id))
+            .cloned()
+            .collect()
+    }
+
     fn session_ids(&self) -> Vec<String> {
+        self.prune();
         self.sessions
             .lock()
             .expect("sessions lock")
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn prune(&self) {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        sessions.retain(|_, session| !session.retention_expired());
+    }
+
+    fn prune_to_capacity(&self) {
+        let mut sessions = self.sessions.lock().expect("sessions lock");
+        if sessions.len() <= MAX_RETAINED_SESSIONS {
+            return;
+        }
+        let mut completed = sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (session.baseline_absorbed.load(Ordering::Acquire))
+                    .then(|| session.completed_at().map(|completed_at| (id.clone(), completed_at)))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        completed.sort_by_key(|(_, completed_at)| *completed_at);
+        let remove_count = sessions.len().saturating_sub(MAX_RETAINED_SESSIONS);
+        for (id, _) in completed.into_iter().take(remove_count) {
+            sessions.remove(&id);
+        }
     }
 }
 
@@ -99,16 +146,19 @@ pub fn kill_workspace_sessions(workspace_root: &Path) -> usize {
                 .session_ids()
                 .into_iter()
                 .filter(|session_id| {
-                    kill_session(
-                        &store,
-                        &json!({
-                            "session_id": session_id,
-                            "signal": "TERM",
-                            "wait_ms": 1500,
-                            "max_output_bytes": 1024
-                        }),
-                    )
-                    .is_ok()
+                    let Ok(session) = store.get(session_id.as_str()) else {
+                        return false;
+                    };
+                    tauri::async_runtime::block_on(async {
+                        if session.is_running().await {
+                            if deliver_signal(&session, "KILL").await.is_ok() {
+                                session.mark_termination_reason("killed");
+                                let _ = wait_for_exit(&session, 1500).await;
+                            }
+                        }
+                    });
+                    store.remove(session_id.as_str());
+                    true
                 })
                 .count()
         })
@@ -120,7 +170,9 @@ pub struct ExecSession {
     pub(crate) child: AsyncMutex<Child>,
     pub stdin: AsyncMutex<Option<ChildStdin>>,
     stdin_open: Mutex<bool>,
-    interactive: bool,
+    interactive_requested: bool,
+    pty_attached: bool,
+    stderr_merged: bool,
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
     stdout_total: Mutex<usize>,
@@ -129,15 +181,29 @@ pub struct ExecSession {
     pub exit_code: Mutex<Option<i32>>,
     exited: AtomicBool,
     termination_reason: Mutex<Option<String>>,
+    completed_at: Mutex<Option<Instant>>,
+    retention_scheduled: AtomicBool,
     reader_tasks: AsyncMutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    tracked_task_id: Option<String>,
+    baseline_before: Option<ProjectBaseline>,
+    baseline_absorbed: AtomicBool,
+    affected_files: Mutex<Vec<FileChangeRecord>>,
+    operation_id: Mutex<Option<String>>,
+    operation_finalized: AtomicBool,
+    event_finalized: AtomicBool,
+    planning_finalized: AtomicBool,
 }
 
 impl ExecSession {
-    pub fn new(child: Child) -> Self {
-        Self::new_with_mode(child, false)
-    }
-
-    pub fn new_with_mode(mut child: Child, interactive: bool) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mode(
+        mut child: Child,
+        interactive_requested: bool,
+        pty_attached: bool,
+        stderr_merged: bool,
+        tracked_task_id: Option<String>,
+        baseline_before: Option<ProjectBaseline>,
+    ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let stdin = child.stdin.take();
         let stdin_open = stdin.is_some();
@@ -146,7 +212,9 @@ impl ExecSession {
             child: AsyncMutex::new(child),
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
-            interactive,
+            interactive_requested,
+            pty_attached,
+            stderr_merged,
             stdout: Mutex::new(Vec::new()),
             stderr: Mutex::new(Vec::new()),
             stdout_total: Mutex::new(0),
@@ -155,7 +223,17 @@ impl ExecSession {
             exit_code: Mutex::new(None),
             exited: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
+            completed_at: Mutex::new(None),
+            retention_scheduled: AtomicBool::new(false),
             reader_tasks: AsyncMutex::new(Vec::new()),
+            tracked_task_id,
+            baseline_before,
+            baseline_absorbed: AtomicBool::new(false),
+            affected_files: Mutex::new(Vec::new()),
+            operation_id: Mutex::new(None),
+            operation_finalized: AtomicBool::new(false),
+            event_finalized: AtomicBool::new(false),
+            planning_finalized: AtomicBool::new(false),
         }
     }
 
@@ -187,7 +265,7 @@ impl ExecSession {
     pub async fn wait_for_readers(&self) {
         let mut tasks = self.reader_tasks.lock().await;
         while let Some(task) = tasks.pop() {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
+            let _ = tokio::time::timeout(Duration::from_millis(750), task).await;
         }
     }
 
@@ -219,13 +297,9 @@ impl ExecSession {
     }
 
     pub async fn kill_and_wait(&self) {
-        let status = {
-            let mut child = self.child.lock().await;
-            let _ = child.start_kill();
-            child.wait().await.ok()
-        };
-        if let Some(status) = status {
-            self.record_exit_status(status);
+        if deliver_signal(self, "KILL").await.is_ok() {
+            self.mark_termination_reason("killed");
+            let _ = wait_for_exit(self, 1500).await;
         }
     }
 
@@ -240,6 +314,10 @@ impl ExecSession {
         *self.exit_code.lock().expect("exit_code lock") = status.code();
         self.exited.store(true, Ordering::Release);
         *self.stdin_open.lock().expect("stdin_open lock") = false;
+        let mut completed_at = self.completed_at.lock().expect("completed_at lock");
+        if completed_at.is_none() {
+            *completed_at = Some(Instant::now());
+        }
         let mut reason = self.termination_reason.lock().expect("termination lock");
         if reason.is_none() {
             *reason = Some("exited".into());
@@ -263,19 +341,38 @@ impl ExecSession {
         !self.has_exited()
     }
 
-    pub fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize) {
-        match stream {
-            "stderr" => {
-                let data = self.stderr.lock().expect("stderr lock").clone();
-                let total = *self.stderr_total.lock().expect("stderr_total lock");
-                (data, total)
-            }
-            _ => {
-                let data = self.stdout.lock().expect("stdout lock").clone();
-                let total = *self.stdout_total.lock().expect("stdout_total lock");
-                (data, total)
-            }
-        }
+    pub fn tracked_task_id(&self) -> Option<&str> {
+        self.tracked_task_id.as_deref()
+    }
+
+    pub fn bind_operation(&self, operation_id: &str) {
+        *self.operation_id.lock().expect("operation id lock") = Some(operation_id.to_string());
+    }
+
+    pub fn completed_at(&self) -> Option<Instant> {
+        *self.completed_at.lock().expect("completed_at lock")
+    }
+
+    fn retention_expired(&self) -> bool {
+        self.baseline_absorbed.load(Ordering::Acquire)
+            && self
+                .completed_at()
+                .is_some_and(|completed| completed.elapsed() >= SESSION_RETAIN_FOR)
+    }
+
+    pub fn retained_stream_bytes(&self, stream: &str) -> (Vec<u8>, usize, usize) {
+        let (data, total) = match stream {
+            "stderr" => (
+                self.stderr.lock().expect("stderr lock").clone(),
+                *self.stderr_total.lock().expect("stderr_total lock"),
+            ),
+            _ => (
+                self.stdout.lock().expect("stdout lock").clone(),
+                *self.stdout_total.lock().expect("stdout_total lock"),
+            ),
+        };
+        let retained_start = total.saturating_sub(data.len());
+        (data, total, retained_start)
     }
 
     pub fn snapshot(&self, max_output_bytes: usize) -> Value {
@@ -289,20 +386,23 @@ impl ExecSession {
             .lock()
             .expect("termination lock")
             .clone();
-        let status = if self.has_exited() {
-            "exited"
-        } else {
-            "running"
-        };
+        let status = if self.has_exited() { "exited" } else { "running" };
         let reason = termination_reason.as_deref().unwrap_or("running");
         let command_ok = match reason {
             "exited" => Some(exit_code.is_some_and(|code| code == 0)),
             "running" => None,
             _ => Some(false),
         };
+        let operation_id = self.operation_id.lock().expect("operation id lock").clone();
+        let affected_files = self.affected_files.lock().expect("affected files lock").clone();
         json!({
             "session_id": self.session_id,
-            "interactive": self.interactive,
+            "operation_id": operation_id,
+            "tracked_task_id": self.tracked_task_id,
+            "interactive_requested": self.interactive_requested,
+            "interactive": self.pty_attached,
+            "pty_attached": self.pty_attached,
+            "stderr_merged": self.stderr_merged,
             "stdin_open": *self.stdin_open.lock().expect("stdin_open lock"),
             "status": status,
             "termination_reason": reason,
@@ -322,6 +422,8 @@ impl ExecSession {
             "stdout_truncated": stdout.truncated,
             "stderr_truncated": stderr.truncated,
             "elapsed_ms": self.started_at.elapsed().as_millis(),
+            "retention_seconds": SESSION_RETAIN_FOR.as_secs(),
+            "affected_files": affected_files,
             "output_refs": {
                 "stdout": format!("session:{}:stdout", self.session_id),
                 "stderr": format!("session:{}:stderr", self.session_id)
@@ -351,7 +453,191 @@ fn truncate_tail(bytes: &[u8], max_bytes: usize) -> Truncated {
     }
 }
 
-pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn bind_operation_and_finalize(ctx: &ToolContext, session_id: &str, operation_id: &str) {
+    if let Ok(session) = ctx.sessions.get(session_id) {
+        session.bind_operation(operation_id);
+        tauri::async_runtime::block_on(session.refresh_status());
+        if session.has_exited() {
+            let _ = finalize_session(ctx, &session);
+            schedule_session_eviction(ctx.sessions.clone(), session);
+        }
+    }
+}
+
+pub fn reconcile_task_sessions(ctx: &ToolContext, task_id: &str) -> Result<bool, WorkspaceError> {
+    let sessions = ctx.sessions.task_sessions(task_id);
+    let mut running = false;
+    for session in sessions {
+        tauri::async_runtime::block_on(session.refresh_status());
+        if session.has_exited() {
+            finalize_session(ctx, &session)?;
+            schedule_session_eviction(ctx.sessions.clone(), session);
+        } else {
+            running = true;
+        }
+    }
+    Ok(running)
+}
+
+pub(crate) fn finalize_session(
+    ctx: &ToolContext,
+    session: &Arc<ExecSession>,
+) -> Result<(), WorkspaceError> {
+    finalize_session_parts(&ctx.harness, ctx.workspace.root(), session)
+}
+
+fn finalize_session_parts(
+    harness: &Harness,
+    workspace_root: &Path,
+    session: &Arc<ExecSession>,
+) -> Result<(), WorkspaceError> {
+    if !session.has_exited() {
+        return Ok(());
+    }
+
+    if !session.baseline_absorbed.load(Ordering::Acquire) {
+        if let (Some(task_id), Some(before)) = (session.tracked_task_id(), session.baseline_before.as_ref()) {
+            let after = harness.capture_current_baseline(Some(before));
+            let changes = diff_baselines(before, &after);
+            harness
+                .refresh_expected_state(task_id)
+                .map_err(|error| WorkspaceError::Tool {
+                    code: "BASELINE_REFRESH_FAILED",
+                    message: error.to_string(),
+                    category: "runtime",
+                    retryable: true,
+                })?;
+            *session.affected_files.lock().expect("affected files lock") = changes;
+        }
+        session.baseline_absorbed.store(true, Ordering::Release);
+    }
+
+    finalize_task_event(harness, session);
+    finalize_operation_record(harness, session);
+    finalize_planning_ledger(workspace_root, session);
+    Ok(())
+}
+
+fn finalize_task_event(harness: &Harness, session: &ExecSession) {
+    let Some(task_id) = session.tracked_task_id() else {
+        return;
+    };
+    if session
+        .event_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if harness
+        .record_event(
+            task_id,
+            "operation_finished",
+            Some("exec_command"),
+            json!({"session_id": session.session_id}),
+            session.snapshot(65_536),
+        )
+        .is_err()
+    {
+        session.event_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn finalize_operation_record(harness: &Harness, session: &ExecSession) {
+    let Some(operation_id) = session.operation_id.lock().expect("operation id lock").clone() else {
+        return;
+    };
+    if session
+        .operation_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let snapshot = session.snapshot(65_536);
+    let kind = terminal_operation_kind(&snapshot);
+    if harness
+        .record_operation(
+            Some(&operation_id),
+            session.tracked_task_id(),
+            "exec_command",
+            kind,
+            json!({"reason": "session_terminal"}),
+            snapshot,
+        )
+        .is_err()
+    {
+        session.operation_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn finalize_planning_ledger(workspace_root: &Path, session: &ExecSession) {
+    if session
+        .planning_finalized
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let snapshot = session.snapshot(65_536);
+    let state = match terminal_operation_kind(&snapshot) {
+        "completed" => "completed",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    };
+    let last_error = if state == "failed" {
+        snapshot
+            .get("stderr")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                snapshot
+                    .get("termination_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    };
+    let changed_files = session
+        .affected_files
+        .lock()
+        .expect("affected files lock")
+        .iter()
+        .map(|change| change.path.clone())
+        .collect();
+    if PlanningService::new(workspace_root)
+        .record_execution(ExecutionLedgerUpdate {
+            task_id: session.tracked_task_id().map(str::to_string),
+            last_tool: Some("exec_command".into()),
+            state: Some(state.into()),
+            last_error,
+            changed_files,
+            history_checkpoint_ref: None,
+            verification: Vec::new(),
+        })
+        .is_err()
+    {
+        session.planning_finalized.store(false, Ordering::Release);
+    }
+}
+
+fn terminal_operation_kind(snapshot: &Value) -> &'static str {
+    match snapshot
+        .get("termination_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("running")
+    {
+        "exited" if snapshot.get("command_ok").and_then(Value::as_bool) == Some(true) => "completed",
+        "killed" => "cancelled",
+        "running" => "running",
+        _ => "failed",
+    }
+}
+
+pub fn read_output(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let output_ref = args
         .get("output_ref")
         .and_then(Value::as_str)
@@ -369,8 +655,12 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
             "output_ref stream must be stdout, stderr, or full",
         ));
     }
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
     tauri::async_runtime::block_on(session.refresh_status());
+    if session.has_exited() {
+        finalize_session(ctx, &session)?;
+        schedule_session_eviction(ctx.sessions.clone(), session.clone());
+    }
 
     let requested_stream = args.get("stream").and_then(Value::as_str).unwrap_or("");
     let stream = if ref_stream == "stdout" || ref_stream == "stderr" {
@@ -381,47 +671,61 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         "stdout"
     };
 
-    let (data, total_stream_bytes) = session.retained_stream_bytes(stream);
+    let (data, total_stream_bytes, retained_start_offset) = session.retained_stream_bytes(stream);
     let requested_offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(4096)
         .clamp(1, 1_048_576) as usize;
-    let buffer_offset = requested_offset.min(data.len());
-    let chunk = &data[buffer_offset..data.len().min(buffer_offset + limit)];
-    let next_offset = if buffer_offset + chunk.len() < total_stream_bytes {
-        Some((buffer_offset + chunk.len()) as u64)
-    } else {
-        None
-    };
+    let actual_offset = requested_offset
+        .max(retained_start_offset)
+        .min(total_stream_bytes);
+    let local_offset = actual_offset.saturating_sub(retained_start_offset).min(data.len());
+    let local_end = data.len().min(local_offset.saturating_add(limit));
+    let chunk = &data[local_offset..local_end];
+    let absolute_end = actual_offset.saturating_add(chunk.len());
+    let next_offset = (absolute_end < total_stream_bytes).then_some(absolute_end as u64);
+    let dropped_before_requested = requested_offset < retained_start_offset;
+    let mut warnings = Vec::new();
+    if ref_stream == "full" {
+        warnings.push("legacy full output_ref defaults to stdout; use output_refs for stable stream paging");
+    }
+    if dropped_before_requested {
+        warnings.push("requested offset was older than retained output; page starts at retained_start_offset");
+    }
 
     Ok(tool_ok(json!({
         "output_ref": output_ref,
         "stream_output_ref": format!("session:{session_id}:{stream}"),
         "stream": stream,
-        "offset": buffer_offset,
+        "offset": actual_offset,
         "requested_offset": requested_offset,
         "limit": limit,
         "content": String::from_utf8_lossy(chunk),
         "next_offset": next_offset,
+        "retained_start_offset": retained_start_offset,
+        "dropped_bytes": retained_start_offset,
         "total_retained_bytes": data.len(),
         "total_stream_bytes": total_stream_bytes,
+        "retention_truncated": retained_start_offset > 0,
         "truncated": next_offset.is_some(),
-        "warnings": if ref_stream == "full" {
-            vec!["legacy full output_ref defaults to stdout; use output_refs for stable stream paging"]
-        } else {
-            Vec::<&str>::new()
-        }
+        "session_status": if session.has_exited() { "exited" } else { "running" },
+        "exit_code": *session.exit_code.lock().expect("exit_code lock"),
+        "command_ok": session.snapshot(1)["command_ok"].clone(),
+        "operation_id": session.operation_id.lock().expect("operation id lock").clone(),
+        "affected_files": session.affected_files.lock().expect("affected files lock").clone(),
+        "warnings": warnings
     })))
 }
 
-pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn write_stdin(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("session_id is required"))?;
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
+    ensure_session_task_writable(ctx, &session)?;
     let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
     let max_output_bytes = args
         .get("max_output_bytes")
@@ -438,6 +742,8 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
                 retryable: false,
             });
         }
+        finalize_session(ctx, &session)?;
+        schedule_session_eviction(ctx.sessions.clone(), session.clone());
         return Ok(tool_ok(session.snapshot(max_output_bytes)));
     }
 
@@ -469,17 +775,24 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
         .and_then(Value::as_u64)
         .unwrap_or(1000)
         .min(30_000);
-    std::thread::sleep(std::time::Duration::from_millis(yield_ms));
+    if yield_ms > 0 {
+        std::thread::sleep(Duration::from_millis(yield_ms));
+    }
     tauri::async_runtime::block_on(session.refresh_status());
+    if session.has_exited() {
+        tauri::async_runtime::block_on(session.wait_for_readers());
+        finalize_session(ctx, &session)?;
+        schedule_session_eviction(ctx.sessions.clone(), session.clone());
+    }
     Ok(tool_ok(session.snapshot(max_output_bytes)))
 }
 
-pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn kill_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("session_id is required"))?;
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
     let max_output_bytes = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -490,82 +803,291 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
         .unwrap_or(5000)
         .min(30_000);
     let signal = args.get("signal").and_then(Value::as_str).unwrap_or("TERM");
+    if !matches!(signal, "TERM" | "KILL" | "INT") {
+        return Err(WorkspaceError::invalid_argument("signal must be TERM, KILL, or INT"));
+    }
 
     let running = tauri::async_runtime::block_on(session.is_running());
     let mut killed = false;
     let mut status = "exited";
-    let mut evicted = true;
+    let mut escalated = false;
+    let mut signal_effective = signal.to_string();
+    let mut warnings = Vec::<String>::new();
 
     if running {
+        let delivery = tauri::async_runtime::block_on(deliver_signal(&session, signal))?;
+        signal_effective = delivery.effective;
+        if let Some(warning) = delivery.warning {
+            warnings.push(warning);
+        }
         session.mark_termination_reason("killed");
-        tauri::async_runtime::block_on(async {
-            let pid = {
-                let child = session.child.lock().await;
-                child.id()
-            };
-            if let Some(pid) = pid {
-                send_session_signal(pid, signal);
-            } else {
-                let mut child = session.child.lock().await;
-                let _ = child.start_kill();
+        let exited = tauri::async_runtime::block_on(wait_for_exit(&session, wait_ms));
+        if !exited && signal != "KILL" {
+            escalated = true;
+            let delivery = tauri::async_runtime::block_on(deliver_signal(&session, "KILL"))?;
+            signal_effective = delivery.effective;
+            if let Some(warning) = delivery.warning {
+                warnings.push(warning);
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(wait_ms), async {
-                let mut child = session.child.lock().await;
-                let _ = child.wait().await;
-            })
-            .await;
-        });
+            let _ = tauri::async_runtime::block_on(wait_for_exit(&session, 1000));
+        }
         tauri::async_runtime::block_on(session.refresh_status());
-        if tauri::async_runtime::block_on(session.is_running()) {
-            status = "terminating";
-            evicted = false;
-        } else {
+        if session.has_exited() {
+            tauri::async_runtime::block_on(session.wait_for_readers());
             killed = true;
             status = "killed";
+            finalize_session(ctx, &session)?;
+            schedule_session_eviction(ctx.sessions.clone(), session.clone());
+        } else {
+            status = "terminating";
+            warnings.push("Process tree did not exit within the requested wait window".into());
         }
+    } else {
+        finalize_session(ctx, &session)?;
+        schedule_session_eviction(ctx.sessions.clone(), session.clone());
     }
 
     let mut payload = session.snapshot(max_output_bytes);
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("killed".into(), json!(killed));
         obj.insert("status".into(), json!(status));
-        obj.insert("evicted".into(), json!(evicted));
-        if status == "terminating" {
-            obj.insert(
-                "warnings".into(),
-                json!(["Process did not exit after kill; session retained for retry"]),
-            );
+        obj.insert("evicted".into(), Value::Bool(false));
+        obj.insert("signal_requested".into(), json!(signal));
+        obj.insert("signal_effective".into(), json!(signal_effective));
+        obj.insert("escalated".into(), json!(escalated));
+        if !warnings.is_empty() {
+            obj.insert("warnings".into(), json!(warnings));
         }
     }
-
-    if evicted {
-        store.remove(session_id);
-    }
-
     Ok(tool_ok(payload))
 }
 
+fn ensure_session_task_writable(ctx: &ToolContext, session: &ExecSession) -> Result<(), WorkspaceError> {
+    let Some(task_id) = session.tracked_task_id() else {
+        return Ok(());
+    };
+    let task = ctx.harness.task(task_id).map_err(|error| WorkspaceError::Tool {
+        code: "TASK_STATE_UNAVAILABLE",
+        message: error.to_string(),
+        category: "runtime",
+        retryable: true,
+    })?;
+    if task.status.is_writable() {
+        Ok(())
+    } else {
+        Err(WorkspaceError::Tool {
+            code: "TASK_NOT_WRITABLE",
+            message: "Tracked command task is no longer writable; use kill_session or resume the task.".into(),
+            category: "permission",
+            retryable: true,
+        })
+    }
+}
+
+fn schedule_session_eviction(store: Arc<SessionStore>, session: Arc<ExecSession>) {
+    if session
+        .retention_scheduled
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let session_id = session.session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(SESSION_RETAIN_FOR).await;
+        store.remove(&session_id);
+    });
+}
+
+pub fn spawn_session_monitor(
+    store: Arc<SessionStore>,
+    harness: Harness,
+    workspace_root: PathBuf,
+    session: Arc<ExecSession>,
+    deadline: Instant,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            session.refresh_status().await;
+            if session.has_exited() {
+                session.wait_for_readers().await;
+                let _ = finalize_session_parts(&harness, &workspace_root, &session);
+                schedule_session_eviction(store.clone(), session.clone());
+                return;
+            }
+            if Instant::now() >= deadline {
+                if deliver_signal(&session, "KILL").await.is_ok() {
+                    session.mark_termination_reason("timeout");
+                    let _ = wait_for_exit(&session, 1500).await;
+                }
+                session.refresh_status().await;
+                session.wait_for_readers().await;
+                let _ = finalize_session_parts(&harness, &workspace_root, &session);
+                schedule_session_eviction(store.clone(), session.clone());
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+}
+
+struct SignalDelivery {
+    effective: String,
+    warning: Option<String>,
+}
+
+async fn wait_for_exit(session: &ExecSession, wait_ms: u64) -> bool {
+    if wait_ms == 0 {
+        session.refresh_status().await;
+        return session.has_exited();
+    }
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    loop {
+        session.refresh_status().await;
+        if session.has_exited() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn deliver_signal(session: &ExecSession, signal: &str) -> Result<SignalDelivery, WorkspaceError> {
+    let pid = {
+        let child = session.child.lock().await;
+        child.id()
+    }
+    .ok_or_else(|| WorkspaceError::Tool {
+        code: "SESSION_CLOSED",
+        message: "Process id is no longer available.".into(),
+        category: "runtime",
+        retryable: false,
+    })?;
+    send_session_signal(pid, signal)
+}
+
 #[cfg(unix)]
-fn send_session_signal(pid: u32, signal: &str) {
+fn send_session_signal(pid: u32, signal: &str) -> Result<SignalDelivery, WorkspaceError> {
     let sig = match signal {
         "KILL" => libc::SIGKILL,
         "INT" => libc::SIGINT,
         _ => libc::SIGTERM,
     };
-    unsafe {
-        libc::kill(pid as i32, sig);
+    let group_result = unsafe { libc::kill(-(pid as i32), sig) };
+    let result = if group_result == 0 {
+        0
+    } else {
+        unsafe { libc::kill(pid as i32, sig) }
+    };
+    if result == 0 {
+        Ok(SignalDelivery {
+            effective: signal.to_string(),
+            warning: None,
+        })
+    } else {
+        Err(WorkspaceError::Tool {
+            code: "SIGNAL_DELIVERY_FAILED",
+            message: format!("Failed to deliver {signal} to process tree {pid}"),
+            category: "runtime",
+            retryable: true,
+        })
     }
 }
 
 #[cfg(windows)]
-fn send_session_signal(pid: u32, _signal: &str) {
+fn send_session_signal(pid: u32, signal: &str) -> Result<SignalDelivery, WorkspaceError> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
+    if signal == "INT" {
+        return Err(WorkspaceError::Tool {
+            code: "SIGNAL_UNSUPPORTED",
+            message: "INT cannot be delivered reliably to hidden Windows process groups. Use TERM or KILL; WSL TTY applications should receive control characters through write_stdin.".into(),
+            category: "runtime",
+            retryable: false,
+        });
+    }
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new("taskkill.exe");
+    command.args(["/PID", &pid.to_string(), "/T"]);
+    if signal == "KILL" {
+        command.arg("/F");
+    }
+    command.creation_flags(CREATE_NO_WINDOW);
+    if command.status().is_ok_and(|status| status.success()) {
+        return Ok(SignalDelivery {
+            effective: signal.to_string(),
+            warning: None,
+        });
+    }
+
     unsafe {
         if let Ok(handle) = OpenProcess(PROCESS_TERMINATE, false, pid) {
-            let _ = TerminateProcess(handle, 1);
+            let result = TerminateProcess(handle, 1);
             let _ = CloseHandle(handle);
+            if result.is_ok() {
+                return Ok(SignalDelivery {
+                    effective: "KILL".into(),
+                    warning: Some(format!(
+                        "{signal} process-tree delivery failed; escalated to TerminateProcess"
+                    )),
+                });
+            }
         }
+    }
+    Err(WorkspaceError::Tool {
+        code: "SIGNAL_DELIVERY_FAILED",
+        message: format!("Failed to terminate Windows process tree {pid}"),
+        category: "runtime",
+        retryable: true,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_paging_never_repeats_offset_after_retention_truncation() {
+        let total = SESSION_BUFFER_BYTES + 1024;
+        let retained_start = total - SESSION_BUFFER_BYTES;
+        let requested = 0usize;
+        let actual = requested.max(retained_start).min(total);
+        let local = actual - retained_start;
+        let chunk_len = 64usize.min(SESSION_BUFFER_BYTES - local);
+        let next = actual + chunk_len;
+        assert_eq!(actual, retained_start);
+        assert!(next > actual);
+        assert!(next <= total);
+    }
+
+    #[test]
+    fn terminal_kind_distinguishes_transport_from_command_failure() {
+        assert_eq!(
+            terminal_operation_kind(&json!({
+                "termination_reason": "exited",
+                "command_ok": true
+            })),
+            "completed"
+        );
+        assert_eq!(
+            terminal_operation_kind(&json!({
+                "termination_reason": "exited",
+                "command_ok": false
+            })),
+            "failed"
+        );
+        assert_eq!(
+            terminal_operation_kind(&json!({
+                "termination_reason": "killed",
+                "command_ok": false
+            })),
+            "cancelled"
+        );
     }
 }

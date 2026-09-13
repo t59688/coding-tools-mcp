@@ -32,6 +32,10 @@ impl PlanningService {
         }
     }
 
+    pub fn storage_path(&self) -> &'static str {
+        self.store.display_path()
+    }
+
     pub fn request_goal_review(&self, goal_id: &str, summary: &str) -> AppResult<Goal> {
         let summary = required_text(summary, "Review summary")?;
         self.store.update(|state| {
@@ -253,28 +257,21 @@ impl PlanningService {
                 })
                 .unwrap_or_default();
 
+            // ExecutionLedger is a snapshot of the latest operation, not an
+            // accumulator. Always replace transient attribution fields so a poll,
+            // kill, or unrelated command cannot inherit stale files/errors/tests.
             state.execution.goal_id = state.focus_goal_id.clone();
             state.execution.plan_id = state.focus_plan_id.clone();
             state.execution.step_id = current_step_id.clone();
-            if update.task_id.is_some() {
-                state.execution.task_id = update.task_id;
-            }
-            if update.last_tool.is_some() {
-                state.execution.last_tool = update.last_tool;
-            }
+            state.execution.task_id = update.task_id;
+            state.execution.last_tool = update.last_tool;
             if let Some(value) = update.state {
                 state.execution.state = value;
             }
             state.execution.last_error = update.last_error.clone();
-            if !update.changed_files.is_empty() {
-                state.execution.changed_files = update.changed_files;
-            }
-            if update.history_checkpoint_ref.is_some() {
-                state.execution.history_checkpoint_ref = update.history_checkpoint_ref;
-            }
-            if !update.verification.is_empty() {
-                state.execution.verification = update.verification;
-            }
+            state.execution.changed_files = update.changed_files;
+            state.execution.history_checkpoint_ref = update.history_checkpoint_ref;
+            state.execution.verification = update.verification;
             state.execution.updated_at = timestamp();
 
             if let Some(goal_id) = state.focus_goal_id.as_deref() {
@@ -340,7 +337,11 @@ impl PlanningService {
                     .success_criteria
                     .iter()
                     .cloned()
-                    .map(|text| SuccessCriterion { id: new_id(), text, completed: false })
+                    .map(|text| SuccessCriterion {
+                        id: new_id(),
+                        text,
+                        completed: false,
+                    })
                     .collect(),
                 constraints: proposal.constraints.clone(),
                 plan_ids: Vec::new(),
@@ -358,12 +359,17 @@ impl PlanningService {
                 title: proposal.title.clone(),
                 objective: proposal.objective.clone(),
                 status: PlanStatus::Active,
-                steps: proposal.plan_steps.iter().cloned().map(|title| PlanStep {
-                    id: new_id(),
-                    title,
-                    status: PlanStepStatus::Pending,
-                    notes: None,
-                }).collect(),
+                steps: proposal
+                    .plan_steps
+                    .iter()
+                    .cloned()
+                    .map(|title| PlanStep {
+                        id: new_id(),
+                        title,
+                        status: PlanStepStatus::Pending,
+                        notes: None,
+                    })
+                    .collect(),
                 task_ids: Vec::new(),
                 revision: 1,
                 created_at: now.clone(),
@@ -734,7 +740,45 @@ mod tests {
             state.execution.history_checkpoint_ref.as_deref(),
             Some("docs/history-session/6.md")
         );
-        assert_eq!(state.goals[0].execution_checkpoint.as_ref().unwrap().current_step_id.as_deref(), Some(step_id.as_str()));
+        assert_eq!(
+            state.goals[0]
+                .execution_checkpoint
+                .as_ref()
+                .unwrap()
+                .current_step_id
+                .as_deref(),
+            Some(step_id.as_str())
+        );
+    }
+
+    #[test]
+    fn execution_ledger_clears_stale_transient_attribution() {
+        let workspace = tempdir().expect("workspace");
+        let service = PlanningService::new(workspace.path());
+        service
+            .record_execution(ExecutionLedgerUpdate {
+                task_id: Some("old-task".into()),
+                last_tool: Some("apply_patch".into()),
+                state: Some("failed".into()),
+                last_error: Some("old error".into()),
+                changed_files: vec!["old.rs".into()],
+                history_checkpoint_ref: Some("old-history.md".into()),
+                verification: vec!["old test".into()],
+            })
+            .expect("old operation");
+        let state = service
+            .record_execution(ExecutionLedgerUpdate {
+                last_tool: Some("server_info".into()),
+                state: Some("completed".into()),
+                ..ExecutionLedgerUpdate::default()
+            })
+            .expect("new operation");
+
+        assert_eq!(state.execution.task_id, None);
+        assert_eq!(state.execution.last_error, None);
+        assert!(state.execution.changed_files.is_empty());
+        assert_eq!(state.execution.history_checkpoint_ref, None);
+        assert!(state.execution.verification.is_empty());
     }
 
     #[test]
@@ -796,7 +840,10 @@ mod tests {
             .expect("reject review");
         let state = service.state().expect("state");
         assert_eq!(rejected.status, GoalStatus::Active);
-        assert_eq!(rejected.review_feedback.as_deref(), Some("Add one more regression test"));
+        assert_eq!(
+            rejected.review_feedback.as_deref(),
+            Some("Add one more regression test")
+        );
         assert_eq!(state.focus_goal_id.as_deref(), Some(goal.id.as_str()));
     }
 }
